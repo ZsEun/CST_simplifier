@@ -300,8 +300,12 @@ class SATParser:
     def _extract_pids(self, face_indices: List[int]) -> Dict[int, int]:
         """Extract pid attribute for each face entity.
 
-        Two-pass: (1) scan pid attribs for direct face refs,
-        (2) walk attribute chain from face for any missed.
+        Four-pass strategy:
+        (1) scan pid attribs for direct face refs
+        (2) walk attribute chain from face's first ref
+        (3) walk ALL refs from face (not just first) looking for attribs
+        (4) reverse search: for each unassigned pid attrib, walk its
+            ref chain looking for entities that share refs with orphan faces
         """
         face_to_pid: Dict[int, int] = {}
         face_set = set(face_indices)
@@ -316,7 +320,7 @@ class SATParser:
                         face_to_pid[ref] = pid_val
                         break
 
-        # Pass 2: walk attribute chain from face
+        # Pass 2: walk attribute chain from face's first ref
         for fi in face_indices:
             if fi in face_to_pid:
                 continue
@@ -340,22 +344,124 @@ class SATParser:
                                 break
                     attr_idx = next_attr if next_attr >= 0 else -1
 
+        # Pass 3: for faces still missing, walk ALL refs (not just first)
+        # and follow any attrib chains found
+        for fi in face_indices:
+            if fi in face_to_pid:
+                continue
+            refs = self._get_refs(self._entities[fi])
+            for ref in refs:
+                if ref < 0 or ref >= len(self._entities):
+                    continue
+                # Check if this ref itself is a pid attrib
+                ref_line = self._entities[ref]
+                m = re.search(r'@3 pid (\d+)', ref_line)
+                if m:
+                    face_to_pid[fi] = int(m.group(1))
+                    break
+                # Walk attrib chain from this ref
+                if "attrib" in self._etype(ref):
+                    attr_idx = ref
+                    visited = {fi}
+                    while 0 <= attr_idx < len(self._entities) and attr_idx not in visited:
+                        visited.add(attr_idx)
+                        attr_line = self._entities[attr_idx]
+                        m = re.search(r'@3 pid (\d+)', attr_line)
+                        if m:
+                            face_to_pid[fi] = int(m.group(1))
+                            break
+                        attr_refs = self._get_refs(attr_line)
+                        next_attr = -1
+                        for ar in attr_refs:
+                            if ar >= 0 and ar not in visited:
+                                if 0 <= ar < len(self._entities) and "attrib" in self._etype(ar):
+                                    next_attr = ar
+                                    break
+                        attr_idx = next_attr if next_attr >= 0 else -1
+                    if fi in face_to_pid:
+                        break
+
+        # Pass 4: for STILL missing faces, try to match by finding pid
+        # attribs whose ref chain leads to an entity that is also
+        # referenced by the orphan face (shared loop, edge, etc.)
+        missing = [fi for fi in face_indices if fi not in face_to_pid]
+        if missing:
+            assigned_pids = set(face_to_pid.values())
+            # Collect all pid attribs not yet assigned
+            unassigned_pid_attribs = []
+            for i, line in enumerate(self._entities):
+                m = re.search(r'@3 pid (\d+)', line)
+                if m:
+                    pid_val = int(m.group(1))
+                    if pid_val not in assigned_pids:
+                        # Only consider pid attribs that reference a face
+                        refs = self._get_refs(line)
+                        for ref in refs:
+                            if 0 <= ref < len(self._entities) and self._etype(ref) == "face":
+                                unassigned_pid_attribs.append((i, pid_val, ref))
+                                break
+
+            missing_set = set(missing)
+            for _, pid_val, face_ref in unassigned_pid_attribs:
+                if face_ref in missing_set and face_ref not in face_to_pid:
+                    face_to_pid[face_ref] = pid_val
+
         return face_to_pid
 
     def _get_surface_info(self, face_idx: int) -> Tuple[Optional[str], dict]:
-        """Get surface type and geometry for a face entity."""
-        refs = self._get_refs(self._entities[face_idx])
+        """Get surface type and geometry for a face entity.
+
+        Strategy:
+        1. Check direct $refs from the face entity for *-surface types
+        2. Check refs-of-refs (one level deeper) — handles cases where
+           the surface is referenced through a loop or other entity
+        3. Scan the face line text for surface keywords as last resort
+        """
+        face_line = self._entities[face_idx]
+        refs = self._get_refs(face_line)
+
+        # Pass 1: direct refs
         for ref in refs:
             if 0 <= ref < len(self._entities):
                 first_word = self._etype(ref)
                 if first_word.endswith("-surface"):
-                    geometry = {}
-                    if first_word == "cone-surface":
-                        geometry = self._parse_cone_surface(self._entities[ref])
-                    elif first_word == "plane-surface":
-                        geometry = self._parse_plane_surface(self._entities[ref])
-                    return first_word, geometry
+                    return self._parse_surface_entity(ref, first_word)
+
+        # Pass 2: one level deeper — check refs of each ref
+        # This handles cases where the face entity doesn't directly
+        # reference its surface (seen in some CST SAT exports where
+        # the last ref is an attrib instead of a surface)
+        for ref in refs:
+            if 0 <= ref < len(self._entities):
+                sub_refs = self._get_refs(self._entities[ref])
+                for sr in sub_refs:
+                    if 0 <= sr < len(self._entities):
+                        first_word = self._etype(sr)
+                        if first_word.endswith("-surface"):
+                            return self._parse_surface_entity(sr, first_word)
+
+        # Pass 3: scan nearby entities. In some SAT files the surface
+        # entity is at face_idx+1 or face_idx+2 (positional convention)
+        for offset in [1, 2, 3]:
+            idx = face_idx + offset
+            if 0 <= idx < len(self._entities):
+                first_word = self._etype(idx)
+                if first_word.endswith("-surface"):
+                    return self._parse_surface_entity(idx, first_word)
+                # Stop if we hit another face or non-related entity
+                if first_word in ("face", "body", "lump", "shell"):
+                    break
+
         return None, {}
+
+    def _parse_surface_entity(self, idx: int, surface_type: str) -> Tuple[str, dict]:
+        """Parse a surface entity and return (type, geometry)."""
+        geometry = {}
+        if surface_type == "cone-surface":
+            geometry = self._parse_cone_surface(self._entities[idx])
+        elif surface_type == "plane-surface":
+            geometry = self._parse_plane_surface(self._entities[idx])
+        return surface_type, geometry
 
     def _parse_cone_surface(self, line: str) -> dict:
         """Parse cone-surface entity for geometry."""

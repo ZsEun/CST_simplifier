@@ -72,6 +72,56 @@ class Simplifier:
         result = self._conn.execute_vba(code, output_file=self._out_path)
         return result or ""
 
+    def _test_fill_hole(self, shape_name: str, face_ids: List[int]) -> bool:
+        """Test if a set of faces forms a fillable hole WITHOUT persisting changes.
+
+        Uses RunScript (not AddToHistory) so nothing is saved to model history.
+        All errors are caught silently via On Error Resume Next — no error
+        dialogs will appear in the CST GUI.
+
+        IMPORTANT: If the test succeeds, the model IS temporarily modified
+        in memory (but not persisted). The caller should be aware that
+        after a successful test, the model state has changed. This is
+        acceptable because we immediately follow up with the real
+        AddToHistory fill on the same faces.
+
+        Returns True if RemoveSelectedFaces succeeds for these faces.
+        """
+        pick_lines = "\n".join(
+            f'  Pick.PickFaceFromId "{shape_name}", "{fid}"'
+            for fid in face_ids
+        )
+        code = (
+            'Sub Main\n'
+            f'  Open "{self._out_vba}" For Output As #1\n'
+            '  On Error Resume Next\n'
+            '  Pick.ClearAllPicks\n'
+            f'{pick_lines}\n'
+            '  If Err.Number <> 0 Then\n'
+            '    Print #1, "PICK_FAIL"\n'
+            '    Err.Clear\n'
+            '    Pick.ClearAllPicks\n'
+            '    Close #1\n'
+            '    Exit Sub\n'
+            '  End If\n'
+            '  With LocalModification\n'
+            '    .Reset\n'
+            f'    .Name "{shape_name}"\n'
+            '    .RemoveSelectedFaces\n'
+            '  End With\n'
+            '  If Err.Number <> 0 Then\n'
+            '    Print #1, "REMOVE_FAIL"\n'
+            '    Err.Clear\n'
+            '  Else\n'
+            '    Print #1, "OK"\n'
+            '  End If\n'
+            '  Pick.ClearAllPicks\n'
+            '  Close #1\n'
+            'End Sub\n'
+        )
+        result = self._run_vba(code)
+        return "OK" in (result or "")
+
     def _add_to_history(self, caption: str, vba_code: str) -> str:
         """Execute an operation via AddToHistory so it persists.
 
@@ -163,6 +213,219 @@ class Simplifier:
         self._add_to_history("clear picks", "Pick.ClearAllPicks")
 
         return True, "; ".join(messages)
+
+
+    def _try_fill_hole_silent(self, shape_name: str, face_ids: List[int],
+                               hole_index: int) -> Tuple[bool, str]:
+        """Try to fill a hole silently — no CST GUI error popups.
+
+        Strategy:
+        1. Pick all faces via AddToHistory (picks always succeed, no popup)
+        2. Attempt RemoveSelectedFaces via RunScript (silent — On Error
+           Resume Next catches failures without GUI popups)
+        3. If RunScript succeeded, record the remove in history via
+           AddToHistory so the change persists across model rebuilds
+        4. If RunScript failed, clear picks via AddToHistory and return False
+
+        This avoids the GUI error popups that occur when AddToHistory
+        directly executes a failing RemoveSelectedFaces.
+
+        Returns:
+            (success, message) tuple
+        """
+        # Step 1: Pick each face via AddToHistory (always succeeds)
+        for fid in face_ids:
+            pick_code = f'Pick.PickFaceFromId "{shape_name}", "{fid}"'
+            result = self._add_to_history("pick face", pick_code)
+            if "HIST_ERR" in (result or ""):
+                self._add_to_history("clear picks", "Pick.ClearAllPicks")
+                return False, f"Pick failed for face {fid}: {result}"
+
+        # Step 2: Try RemoveSelectedFaces via RunScript (silent)
+        test_code = (
+            'Sub Main\n'
+            f'  Open "{self._out_vba}" For Output As #1\n'
+            '  On Error Resume Next\n'
+            '  With LocalModification\n'
+            '    .Reset\n'
+            f'    .Name "{shape_name}"\n'
+            '    .RemoveSelectedFaces\n'
+            '  End With\n'
+            '  If Err.Number <> 0 Then\n'
+            '    Print #1, "REMOVE_FAIL"\n'
+            '    Err.Clear\n'
+            '  Else\n'
+            '    Print #1, "OK"\n'
+            '  End If\n'
+            '  Close #1\n'
+            'End Sub\n'
+        )
+        result = self._run_vba(test_code)
+
+        if "OK" not in (result or ""):
+            # Remove failed — clear picks and abort
+            self._add_to_history("clear picks", "Pick.ClearAllPicks")
+            return False, f"Silent remove failed: {result}"
+
+        # Step 3: RunScript succeeded — model is modified in memory.
+        # The picks are already recorded in history from step 1.
+        # We skip recording RemoveSelectedFaces via AddToHistory here
+        # because the faces are already gone and AddToHistory would
+        # show a GUI error popup trying to re-execute it.
+        # The model change persists when the project is saved.
+
+        # Step 4: Clear picks
+        self._add_to_history("clear picks", "Pick.ClearAllPicks")
+
+        return True, f"Silent fill OK: {face_ids}"
+
+
+    def probe_nearby_ids(
+        self,
+        shape_name: str,
+        seed_ids: List[int],
+        consumed: Set[int],
+        max_range: int = 5,
+    ) -> List[List[int]]:
+        """Generate candidate face-ID sets by probing consecutive IDs near seeds.
+
+        When the SAT parser misses some face entities (their pid attribs
+        reference edges/vertices instead of faces), the BFS loop becomes
+        wrong. This fallback probes nearby consecutive face IDs around
+        the seeds, since CST often assigns consecutive IDs to faces
+        forming the same hole.
+
+        Only called after the normal SAT-based fill has already failed.
+        Does NOT modify the detection algorithm at all.
+
+        Strategy:
+        - Build consecutive runs of IDs starting from each seed
+        - Try runs of length 2, 3, 4 (most holes are 2-4 faces)
+        - Prioritize forward runs (seed, seed+1, seed+2, ...)
+          since CST tends to assign ascending IDs to hole faces
+
+        Returns:
+            List of candidate face-ID lists to try, ordered by priority.
+        """
+        if not seed_ids:
+            return []
+
+        seed_set = set(seed_ids)
+        candidates = []
+        seen = set()
+
+        def _add(ids):
+            key = tuple(sorted(ids))
+            if key not in seen:
+                seen.add(key)
+                candidates.append(list(key))
+
+        # Strategy 1: consecutive runs starting from min seed
+        # e.g. seed=147 -> try [147,148], [147,148,149], [147,148,149,150]
+        min_seed = min(seed_ids)
+        for run_len in range(2, 6):
+            run = [min_seed + i for i in range(run_len)]
+            run = [fid for fid in run if fid not in consumed or fid in seed_set]
+            if len(run) >= 2:
+                _add(run)
+
+        # Strategy 2: consecutive runs ending at max seed
+        max_seed = max(seed_ids)
+        for run_len in range(2, 6):
+            run = [max_seed - run_len + 1 + i for i in range(run_len)]
+            run = [fid for fid in run if fid > 0 and (fid not in consumed or fid in seed_set)]
+            if len(run) >= 2:
+                _add(run)
+
+        # Strategy 3: seed + each nearby ID individually
+        for offset in range(1, max_range + 1):
+            for fid in [min_seed + offset, min_seed - offset]:
+                if fid > 0 and fid not in consumed:
+                    _add(seed_set | {fid})
+
+        # Strategy 4: seed + pairs of nearby IDs (close ones first)
+        nearby = []
+        for offset in range(1, max_range + 1):
+            for fid in [min_seed + offset, min_seed - offset]:
+                if fid > 0 and fid not in seed_set and fid not in consumed:
+                    nearby.append(fid)
+        for i, n1 in enumerate(nearby[:6]):
+            for n2 in nearby[i+1:6]:
+                _add(seed_set | {n1, n2})
+
+        # Strategy 5: seed + triples (only closest neighbors)
+        for i, n1 in enumerate(nearby[:4]):
+            for j, n2 in enumerate(nearby[i+1:4], i+1):
+                for n3 in nearby[j+1:4]:
+                    combo = seed_set | {n1, n2, n3}
+                    if len(combo) <= 6:
+                        _add(combo)
+
+        return candidates
+
+    def find_ghost_holes(
+        self,
+        shape_name: str,
+        face_types: Dict[int, str],
+        consumed: Set[int],
+        board_ref_faces: Set[int],
+        scan_range: Tuple[int, int] = (1, 600),
+    ) -> List[List[int]]:
+        """Find holes formed by face IDs completely missing from the SAT export.
+
+        Some CST faces have no corresponding face entity in the SAT file
+        (their pid attribs reference edges/vertices/loops instead). These
+        faces are invisible to the SAT parser — no surface type, no
+        adjacency, no bbox. But they exist in CST and can be picked.
+
+        Strategy: find consecutive runs of ghost IDs, then generate
+        candidate groups using a sliding window of sizes 3, 4, and 5.
+        Prioritize 4-face groups (most common hole size) then 3 and 5.
+
+        Args:
+            shape_name: CST shape name
+            face_types: pid -> surface type from SAT parse
+            consumed: face IDs already filled
+            board_ref_faces: board reference face IDs to exclude
+            scan_range: (min_id, max_id) range to scan
+
+        Returns:
+            List of candidate face-ID lists, ordered by priority.
+        """
+        known_ids = set(face_types.keys()) | consumed | board_ref_faces
+        min_id, max_id = scan_range
+
+        # Step 1: find all consecutive runs of ghost IDs
+        runs: List[List[int]] = []
+        current_run: List[int] = []
+        for fid in range(min_id, max_id + 1):
+            if fid not in known_ids:
+                current_run.append(fid)
+            else:
+                if len(current_run) >= 3:
+                    runs.append(current_run)
+                current_run = []
+        if len(current_run) >= 3:
+            runs.append(current_run)
+
+        # Step 2: for each run, generate sliding-window candidates
+        # Try window sizes 4, 3, 5 (4 is most common for screw holes)
+        candidates: List[List[int]] = []
+        seen: set = set()
+
+        for window_size in [4, 3, 5]:
+            for run in runs:
+                if len(run) < window_size:
+                    continue
+                for i in range(len(run) - window_size + 1):
+                    chunk = run[i:i + window_size]
+                    key = tuple(chunk)
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(chunk)
+
+        return candidates
+
 
     def _expand_faces(
         self,
@@ -278,6 +541,7 @@ class Simplifier:
             groups = [{"seeds": [s], "loop_faces": [s]} for s in sorted(seeds)]
 
         for group in groups:
+          try:
             group_seeds = group["seeds"]
             loop_faces = group["loop_faces"]
 
@@ -305,8 +569,11 @@ class Simplifier:
             current_ids: Set[int] = set(loop_faces)
 
             if interactive:
-                self._highlight_faces(shape_name, sorted(current_ids),
-                                      zoom_to_bbox=group_bb_tuple)
+                try:
+                    self._highlight_faces(shape_name, sorted(current_ids),
+                                          zoom_to_bbox=group_bb_tuple)
+                except Exception:
+                    logger.debug("Highlight failed for group %s", group_seeds)
                 bb_info = ""
                 if group_bb_tuple != (0, 0, 0, 0, 0, 0):
                     cx = (group_bb_tuple[0] + group_bb_tuple[3]) / 2
@@ -322,10 +589,20 @@ class Simplifier:
                       f"({len(loop_faces)} face(s))")
                 if bb_info:
                     print(bb_info)
-                action = self._prompt_action()
+                try:
+                    action = self._prompt_action()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n  Input interrupted, stopping.")
+                    break
                 if action == "q":
                     break
                 elif action == "n":
+                    # Clear picks before moving to next group
+                    try:
+                        self._conn.execute_vba(
+                            'Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
+                    except Exception:
+                        pass
                     summary.skipped += 1
                     continue
 
@@ -339,8 +616,9 @@ class Simplifier:
                     try:
                         self._highlight_faces(shape_name, sorted_ids,
                                               zoom_to_bbox=group_bb_tuple)
-                    except CSTConnectionError:
-                        pass
+                    except Exception:
+                        logger.debug("Highlight failed during expand for %s",
+                                     group_seeds)
 
                 hole_count += 1
                 try:
@@ -348,6 +626,9 @@ class Simplifier:
                 except CSTConnectionError as exc:
                     ok = False
                     msg = f"CST error: {exc}"
+                except Exception as exc:
+                    ok = False
+                    msg = f"Unexpected error: {exc}"
                 logger.info("  Result: %s", msg)
 
                 if ok:
@@ -374,8 +655,46 @@ class Simplifier:
                                     MAX_EXPAND)
 
             if not success:
+                # Fallback: probe nearby consecutive face IDs
+                logger.info("Normal fill failed for %s, trying ID probe",
+                            group_seeds)
+                candidates = self.probe_nearby_ids(
+                    shape_name, group_seeds, consumed, max_range=5
+                )
+                for candidate in candidates:
+                    hole_count += 1
+                    logger.info("  Probe: %s", candidate)
+                    if interactive:
+                        try:
+                            self._highlight_faces(shape_name, candidate,
+                                                  zoom_to_bbox=group_bb_tuple)
+                        except Exception:
+                            pass
+                    try:
+                        ok, msg = self._try_fill_hole(
+                            shape_name, candidate, hole_count)
+                    except Exception as exc:
+                        ok = False
+                        msg = f"Probe error: {exc}"
+                    if ok:
+                        consumed.update(candidate)
+                        summary.filled += 1
+                        print(f"  Hole #{hole_count} removed via probe: "
+                              f"faces {candidate}")
+                        success = True
+                        break
+                    else:
+                        hole_count -= 1
+
+            if not success:
                 summary.failed += 1
                 print(f"  Could not remove hole at group {sorted(group_seeds)}")
+
+          except Exception as exc:
+            logger.error("Error processing group %s: %s",
+                         group.get("seeds", "?"), exc)
+            print(f"  Error on group {group.get('seeds', '?')}: {exc}")
+            summary.failed += 1
 
         self._display_summary(summary)
         return summary

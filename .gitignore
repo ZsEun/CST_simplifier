@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# IDE
+.vscode/
+.kiro/
+
+# Debug output
+debug_output.txt
+debug_sat.txt
+debug_sat_v2.txt
+debug_sat_v5.txt
+debug_export.*
+debug_simplified_*.sat
+
+# CST model data (large binary files)
+cst_simplifier/
+*.cst
+*.sab
+*.stp
+*.hlg
+
+# Session notes
+SESSION_SUMMARY.md
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
