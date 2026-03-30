@@ -1,22 +1,22 @@
 """Run full simplification pipeline on Sunray_MB_v3 with interactive mode.
 
-v4 adds a "ghost face scan" phase after the normal SAT-based fill.
-Ghost faces are face IDs that have NO face entity in the SAT export
-(e.g. faces 149-163 in the Sunray model).
+v5 adds WCS-based hole location indicator on top of v4.
+When highlighting a hole, the local WCS origin is moved to the hole's
+bbox center so the coordinate crosshair marks the hole location in the
+CST GUI, making small holes easy to find.
 
-After the normal SAT-detected fill completes, v4:
-1. Finds all face IDs missing from the SAT export (ghost faces)
-2. Asks the user one-by-one: "Is this face part of a hole?"
-3. If yes, tries consecutive ID windows (sizes 2-5) around the face
-4. Goes directly to AddToHistory fill (no _test_fill_hole, because
-   RunScript modifies the model in memory and breaks subsequent fills)
+For SAT-detected holes, the bbox comes from the SAT T-field.
+For ghost faces, the bbox is estimated from nearby skipped SAT group
+faces (if available). If no bbox is available, only pick-highlight is
+used (no WCS repositioning).
 
-NOTE: CST 2025 has no working VBA method to extract face bbox/center
-for ghost faces (GetPickedFaceCenter, Solid.GetFaceBoundingBox both
-fail with COM errors). The consecutive window approach is the only
-viable strategy for ghost faces.
+Changes from v4:
+- SAT fill: logs WCS origin coordinates for each group
+- Ghost face scan: estimates bbox from nearby skipped SAT group faces
+  and passes it to _highlight_faces for WCS positioning
+- WCS reset to global in finally block (already in v4)
 
-Run: python -m code.run_sunray_v4
+Run: python -m code.run_sunray_v5
 """
 
 import os
@@ -126,10 +126,11 @@ def main():
             log.log(f"\nProcessing {shape} ({len(seeds)} seeds, "
                      f"{len(groups)} groups)...")
 
-            summary, consumed, skipped_group_faces = _run_sat_fill(
-                simplifier, shape, seeds, data["adjacency"],
-                data["bboxes"], data["face_types"], groups, log,
-            )
+            summary, consumed, skipped_group_faces, skipped_group_bboxes = \
+                _run_sat_fill(
+                    simplifier, shape, seeds, data["adjacency"],
+                    data["bboxes"], data["face_types"], groups, log,
+                )
 
             log.log(f"\n  --- SAT result: filled={summary.filled}, "
                      f"skipped={summary.skipped}, failed={summary.failed}")
@@ -138,7 +139,8 @@ def main():
             log.log(f"\n--- GHOST FACE SCAN ---")
             ghost_summary = _run_ghost_face_scan(
                 simplifier, conn, shape, data["face_types"], data["bboxes"],
-                data["adjacency"], consumed, skipped_group_faces, log,
+                data["adjacency"], consumed, skipped_group_faces,
+                skipped_group_bboxes, log,
             )
             log.log(f"\n  --- Ghost result: filled={ghost_summary.filled}, "
                      f"skipped={ghost_summary.skipped}, failed={ghost_summary.failed}")
@@ -165,12 +167,17 @@ def main():
 
 
 # ======================================================================
-# SAT-detected fill (same logic as run_sunray_v3)
+# SAT-detected fill
 # ======================================================================
 
 def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
                   bboxes, face_types, seed_groups, log):
-    """Run interactive fill for SAT-detected holes. Returns (summary, consumed_set)."""
+    """Run interactive fill for SAT-detected holes.
+
+    Returns (summary, consumed_set, skipped_group_faces, skipped_group_bboxes).
+    skipped_group_bboxes maps face_id -> bbox for faces in skipped/failed groups,
+    so ghost face scan can use them for WCS positioning.
+    """
     from code.models import SessionSummary
 
     summary = SessionSummary()
@@ -180,6 +187,9 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
     groups = seed_groups if seed_groups else [
         {"seeds": [s], "loop_faces": [s]} for s in sorted(seeds)
     ]
+
+    # Track bboxes for skipped/failed groups (for ghost face WCS)
+    group_bboxes = {}  # group_index -> bbox tuple
 
     for gi, group in enumerate(groups):
       try:
@@ -196,11 +206,22 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
         group_bb = _union_bbox(loop_faces, bboxes)
         current_ids = set(loop_faces)
 
+        # Store bbox for this group (used later for ghost face WCS)
+        group_bboxes[gi] = group_bb
+
+        # Highlight with WCS crosshair at hole center
         try:
             simplifier._highlight_faces(shape_name, sorted(current_ids),
                                         zoom_to_bbox=group_bb)
         except Exception:
             pass
+
+        # Log WCS position
+        if group_bb != (0, 0, 0, 0, 0, 0):
+            cx = (group_bb[0] + group_bb[3]) / 2
+            cy = (group_bb[1] + group_bb[4]) / 2
+            cz = (group_bb[2] + group_bb[5]) / 2
+            log.log(f"    WCS origin: ({cx:.2f}, {cy:.2f}, {cz:.2f})")
 
         try:
             action = simplifier._prompt_action()
@@ -299,17 +320,23 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
     log.log(f"  Filled={summary.filled}, Skipped={summary.skipped}, "
              f"Failed={summary.failed}")
 
-    # Collect face IDs from groups that were skipped or failed
-    # (not consumed = not successfully filled)
+    # Collect face IDs and bboxes from groups that were skipped or failed
     skipped_group_faces = set()
-    for group in groups:
+    skipped_group_bboxes = {}  # face_id -> bbox (from the group's union bbox)
+    for gi, group in enumerate(groups):
         group_seeds = group["seeds"]
         if not any(s in consumed for s in group_seeds):
-            # This group was not filled — its faces are candidates for ghost scan
-            skipped_group_faces.update(group["loop_faces"])
-            skipped_group_faces.update(group["seeds"])
+            bb = group_bboxes.get(gi, (0, 0, 0, 0, 0, 0))
+            for fid in group["loop_faces"]:
+                skipped_group_faces.add(fid)
+                if bb != (0, 0, 0, 0, 0, 0):
+                    skipped_group_bboxes[fid] = bb
+            for fid in group["seeds"]:
+                skipped_group_faces.add(fid)
+                if bb != (0, 0, 0, 0, 0, 0):
+                    skipped_group_bboxes[fid] = bb
 
-    return summary, consumed, skipped_group_faces
+    return summary, consumed, skipped_group_faces, skipped_group_bboxes
 
 
 # ======================================================================
@@ -317,12 +344,7 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
 # ======================================================================
 
 def _find_ghost_face_ids(face_types, consumed, bboxes):
-    """Find face IDs missing from the SAT export.
-
-    Scans from 1 to max_known_id + 50. Returns sorted list of IDs
-    that are NOT in face_types and NOT already consumed.
-    Board reference faces (2 largest plane faces) are excluded.
-    """
+    """Find face IDs missing from the SAT export."""
     plane_faces = [pid for pid, st in face_types.items() if "plane" in st]
     board_ref = set()
     if plane_faces:
@@ -356,6 +378,26 @@ def _get_board_ref_faces(face_types, bboxes):
     return set(by_area[:2])
 
 
+def _estimate_ghost_bbox(fid, skipped_group_bboxes):
+    """Estimate a bbox for a ghost face from nearby skipped SAT group faces.
+
+    Ghost faces have no SAT bbox. But if a nearby face ID belongs to a
+    skipped SAT group, we can use that group's bbox as an approximation
+    (the ghost face is likely part of the same hole).
+
+    Returns bbox tuple or None.
+    """
+    # Direct match
+    if fid in skipped_group_bboxes:
+        return skipped_group_bboxes[fid]
+    # Check nearby IDs (within ±5)
+    for offset in range(1, 6):
+        for nearby in [fid + offset, fid - offset]:
+            if nearby in skipped_group_bboxes:
+                return skipped_group_bboxes[nearby]
+    return None
+
+
 def _try_ghost_fill_windows(simplifier, shape_name, seed_fid,
                              consumed, ghost_consumed,
                              skipped_group_faces, log):
@@ -368,27 +410,20 @@ def _try_ghost_fill_windows(simplifier, shape_name, seed_fid,
     faces from groups that failed/were skipped in the SAT fill phase).
     Then falls back to plain consecutive windows.
 
-    Tries window sizes 2-6, sliding around the seed face ID.
     Returns (success, face_list).
     """
     # Strategy 1: Try windows that include nearby skipped SAT group faces.
-    # These faces are known to belong to holes but couldn't be filled
-    # during the SAT phase (e.g. Group 34: seeds=[147,148] with wrong
-    # loop_faces). By including them we get the correct complete hole.
     nearby_skipped = sorted(f for f in skipped_group_faces
                             if abs(f - seed_fid) <= 5
                             and f not in consumed
                             and f not in ghost_consumed)
     if nearby_skipped:
-        # Build a combined set: skipped SAT faces + ghost seed + consecutive range
         combined_base = set(nearby_skipped) | {seed_fid}
         cmin, cmax = min(combined_base), max(combined_base)
-        # Fill gaps between min and max
         for fid in range(cmin, cmax + 1):
             if fid not in consumed and fid not in ghost_consumed:
                 combined_base.add(fid)
 
-        # Try the base combined set, then expand by 1, 2 faces on each side
         for extend in range(0, 3):
             combined = set(combined_base)
             for fid in range(cmin - extend, cmax + extend + 1):
@@ -435,22 +470,12 @@ def _try_ghost_fill_windows(simplifier, shape_name, seed_fid,
 
 
 def _run_ghost_face_scan(simplifier, conn, shape_name, face_types, bboxes,
-                          adjacency, consumed, skipped_group_faces, log):
+                          adjacency, consumed, skipped_group_faces,
+                          skipped_group_bboxes, log):
     """Scan ghost faces one by one, asking user to confirm each.
 
-    Ghost faces have NO face entity in the SAT export, so we cannot use
-    SAT adjacency, surface type, or bbox. CST 2025 also has no working
-    VBA method to extract face bbox/center (GetPickedFaceCenter,
-    Solid.GetFaceBoundingBox both fail with COM errors).
-
-    Strategy: for each ghost face the user confirms as a hole face,
-    try consecutive ID windows (sizes 2-5) around that face ID and
-    go directly to _try_fill_hole (AddToHistory). We skip _test_fill_hole
-    because RunScript modifies the model in memory, which breaks the
-    subsequent AddToHistory fill on the same faces.
-
-    All faces in a successfully filled hole are marked consumed
-    so they won't be asked about again.
+    v5: uses skipped_group_bboxes to estimate ghost face location and
+    position the WCS crosshair, making ghost faces easier to find.
     """
     from code.models import SessionSummary
 
@@ -505,11 +530,22 @@ def _run_ghost_face_scan(simplifier, conn, shape_name, face_types, bboxes,
         except Exception:
             pass
 
-        # Highlight this single face in CST
+        # Estimate bbox from nearby skipped SAT group faces (for WCS)
+        ghost_bb = _estimate_ghost_bbox(fid, skipped_group_bboxes)
+
+        # Highlight this face with WCS crosshair if bbox available
         try:
-            simplifier._highlight_faces(shape_name, [fid])
+            simplifier._highlight_faces(shape_name, [fid],
+                                        zoom_to_bbox=ghost_bb)
         except Exception as exc:
             log.log(f"    Highlight error: {exc}")
+
+        # Log WCS position if available
+        if ghost_bb and ghost_bb != (0, 0, 0, 0, 0, 0):
+            cx = (ghost_bb[0] + ghost_bb[3]) / 2
+            cy = (ghost_bb[1] + ghost_bb[4]) / 2
+            cz = (ghost_bb[2] + ghost_bb[5]) / 2
+            log.log(f"    WCS origin (estimated): ({cx:.2f}, {cy:.2f}, {cz:.2f})")
 
         # Ask user
         print(f"\n  Ghost face {fid} (not in SAT export)")

@@ -266,18 +266,50 @@ class SATParser:
     # ------------------------------------------------------------------
 
     def _find_header(self, lines: List[str]):
-        """Find where entity data begins and store entities."""
+        """Find where entity data begins and store entities.
+
+        Handles multi-line entities (e.g. spline-surface with NURBS data
+        on continuation lines starting with tab). Continuation lines are
+        joined with their parent entity so that $N references resolve
+        to the correct entity index.
+        """
         hdr = 0
+        entity_starts = (
+            "body ", "lump ", "shell ", "face ", "loop ",
+            "coedge ", "edge ", "vertex ", "point ",
+            "integer_attrib", "name_attrib", "rgb_color",
+            "simple-snl", "cstishape",
+            "cone-surface ", "plane-surface ", "spline-surface ",
+            "torus-surface ", "sphere-surface ", "ellipse-curve ",
+            "straight-curve ", "intcurve-curve ", "pcurve ",
+            "cone ", "null",
+        )
         for i, line in enumerate(lines):
             s = line.strip()
-            if any(s.startswith(t) for t in (
-                "body ", "lump ", "shell ", "face ", "loop ",
-                "coedge ", "edge ", "vertex ", "point ",
-                "integer_attrib", "rgb_color", "simple-snl",
-            )):
+            if any(s.startswith(t) for t in entity_starts):
                 hdr = i
                 break
-        self._entities = lines[hdr:]
+
+        # Join continuation lines with their parent entity
+        entities = []
+        for line in lines[hdr:]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # A continuation line starts with tab, or is a data line that
+            # doesn't start with a known entity keyword
+            if line.startswith("\t"):
+                if entities:
+                    entities[-1] = entities[-1] + " " + stripped
+                continue
+            if entities and not any(stripped.startswith(t) for t in entity_starts):
+                # Check if previous entity is complete (ends with #)
+                if entities and not entities[-1].rstrip().endswith("#"):
+                    entities[-1] = entities[-1] + " " + stripped
+                    continue
+            entities.append(line)
+
+        self._entities = entities
 
     def _find_faces(self):
         """Find all face entity indices."""

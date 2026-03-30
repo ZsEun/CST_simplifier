@@ -453,7 +453,10 @@ class Simplifier:
 
     def _highlight_faces(self, shape_name: str, face_ids: List[int],
                          zoom_to_bbox: Tuple = None) -> None:
-        """Pick faces in CST GUI to highlight them, then zoom.
+        """Pick faces in CST GUI and move WCS origin to the hole center.
+
+        Sets the local WCS origin to the bbox center so the coordinate
+        crosshair marks the hole location, making it easy to find.
 
         Uses RunScript (not AddToHistory) since highlighting is
         a view operation, not a model change.
@@ -463,27 +466,23 @@ class Simplifier:
             for fid in face_ids
         )
 
-        zoom_steps = 0
+        # Move WCS origin to bbox center so crosshair marks the hole
+        wcs_lines = ""
         if zoom_to_bbox and zoom_to_bbox != (0, 0, 0, 0, 0, 0):
-            dx = zoom_to_bbox[3] - zoom_to_bbox[0]
-            dy = zoom_to_bbox[4] - zoom_to_bbox[1]
-            dz = zoom_to_bbox[5] - zoom_to_bbox[2]
-            max_dim = max(dx, dy, dz, 0.001)
-            if max_dim < 1.0:
-                zoom_steps = 15
-            elif max_dim < 3.0:
-                zoom_steps = 10
-            elif max_dim < 10.0:
-                zoom_steps = 5
-
-        zoom_lines = "\n".join(['  SendKeys "+"'] * zoom_steps) if zoom_steps else ""
+            cx = (zoom_to_bbox[0] + zoom_to_bbox[3]) / 2
+            cy = (zoom_to_bbox[1] + zoom_to_bbox[4]) / 2
+            cz = (zoom_to_bbox[2] + zoom_to_bbox[5]) / 2
+            wcs_lines = (
+                f'  WCS.SetOrigin {cx}, {cy}, {cz}\n'
+                '  WCS.ActivateWCS "local"\n'
+            )
 
         code = (
             'Sub Main\n'
             '  Plot.ZoomToStructure\n'
             '  Pick.ClearAllPicks\n'
             f'{pick_lines}\n'
-            f'{zoom_lines}\n'
+            f'{wcs_lines}'
             'End Sub\n'
         )
         try:

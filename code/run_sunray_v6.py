@@ -1,22 +1,15 @@
-"""Run full simplification pipeline on Sunray_MB_v3 with interactive mode.
+"""Generic CST CAD simplifier — works with any .cst model.
 
-v4 adds a "ghost face scan" phase after the normal SAT-based fill.
-Ghost faces are face IDs that have NO face entity in the SAT export
-(e.g. faces 149-163 in the Sunray model).
+v6: prompts user for the .cst model path at startup instead of
+hardcoding Sunray_MB_v3. All features from v5 are included:
+- SAT-based hole detection + fill with expansion + probe fallback
+- Ghost face scan with combined strategy
+- WCS crosshair at hole center for easy location
+- Real-time logging to console + file
 
-After the normal SAT-detected fill completes, v4:
-1. Finds all face IDs missing from the SAT export (ghost faces)
-2. Asks the user one-by-one: "Is this face part of a hole?"
-3. If yes, tries consecutive ID windows (sizes 2-5) around the face
-4. Goes directly to AddToHistory fill (no _test_fill_hole, because
-   RunScript modifies the model in memory and breaks subsequent fills)
+The log file is saved next to the .cst file as simplifier_log.txt.
 
-NOTE: CST 2025 has no working VBA method to extract face bbox/center
-for ghost faces (GetPickedFaceCenter, Solid.GetFaceBoundingBox both
-fail with COM errors). The consecutive window approach is the only
-viable strategy for ghost faces.
-
-Run: python -m code.run_sunray_v4
+Run: python -m code.run_sunray_v6
 """
 
 import os
@@ -30,9 +23,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from code.cst_connection import CSTConnection, CSTConnectionError
 from code.feature_detector import FeatureDetector
 from code.simplifier import Simplifier
-
-PROJECT = r"D:\Users\sunze\Desktop\kiro\cst_simplifier\cst_model\Sunray_MB_v3.cst"
-OUT = r"D:\Users\sunze\Desktop\kiro\debug_output.txt"
 
 
 class RunLog:
@@ -71,8 +61,44 @@ def _union_bbox(face_ids, bboxes):
     return tuple(bb) if bb else (0, 0, 0, 0, 0, 0)
 
 
+def _get_project_path() -> str:
+    """Ask user for the .cst model path. Supports command-line arg too."""
+    # Check command-line argument first
+    if len(sys.argv) > 1:
+        path = sys.argv[1].strip().strip('"').strip("'")
+    else:
+        print("=" * 60)
+        print("  CST CAD Simplifier")
+        print("=" * 60)
+        path = input("\n  Enter path to .cst model: ").strip().strip('"').strip("'")
+
+    if not path:
+        print("  Error: no path provided.")
+        sys.exit(1)
+
+    # Normalize path
+    path = os.path.abspath(path)
+
+    if not path.lower().endswith(".cst"):
+        print(f"  Error: expected a .cst file, got: {path}")
+        sys.exit(1)
+
+    if not os.path.exists(path):
+        print(f"  Error: file not found: {path}")
+        sys.exit(1)
+
+    return path
+
+
 def main():
-    log = RunLog(OUT)
+    project_path = _get_project_path()
+
+    # Place log file next to the .cst file
+    log_dir = os.path.dirname(project_path)
+    model_name = os.path.splitext(os.path.basename(project_path))[0]
+    log_path = os.path.join(log_dir, f"{model_name}_simplifier_log.txt")
+
+    log = RunLog(log_path)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -83,8 +109,8 @@ def main():
     try:
         log.log("Connecting to CST...")
         conn.connect()
-        conn.open_project(PROJECT)
-        log.log(f"Opened project: {PROJECT}")
+        conn.open_project(project_path)
+        log.log(f"Opened project: {project_path}")
 
         # --- Detection phase ---
         log.log("\n--- DETECTION PHASE ---")
@@ -126,19 +152,38 @@ def main():
             log.log(f"\nProcessing {shape} ({len(seeds)} seeds, "
                      f"{len(groups)} groups)...")
 
-            summary, consumed, skipped_group_faces = _run_sat_fill(
-                simplifier, shape, seeds, data["adjacency"],
-                data["bboxes"], data["face_types"], groups, log,
-            )
+            summary, consumed, skipped_group_faces, skipped_group_bboxes = \
+                _run_sat_fill(
+                    simplifier, shape, seeds, data["adjacency"],
+                    data["bboxes"], data["face_types"], groups, log,
+                )
 
             log.log(f"\n  --- SAT result: filled={summary.filled}, "
                      f"skipped={summary.skipped}, failed={summary.failed}")
+
+            # Ask user if all holes are already filled
+            print(f"\n  SAT-detected fill complete. "
+                  f"Filled={summary.filled}, Failed={summary.failed}")
+            try:
+                while True:
+                    done = input("  Are all holes filled? (y/n): ").strip().lower()
+                    if done in ("y", "n"):
+                        break
+                    print("  Please enter y or n.")
+            except (EOFError, KeyboardInterrupt):
+                done = "y"
+
+            log.log(f"  All holes filled? {done}")
+            if done == "y":
+                log.log("  Skipping ghost face scan (user confirmed all done).")
+                continue
 
             # --- Ghost face scan phase ---
             log.log(f"\n--- GHOST FACE SCAN ---")
             ghost_summary = _run_ghost_face_scan(
                 simplifier, conn, shape, data["face_types"], data["bboxes"],
-                data["adjacency"], consumed, skipped_group_faces, log,
+                data["adjacency"], consumed, skipped_group_faces,
+                skipped_group_bboxes, log,
             )
             log.log(f"\n  --- Ghost result: filled={ghost_summary.filled}, "
                      f"skipped={ghost_summary.skipped}, failed={ghost_summary.failed}")
@@ -161,16 +206,19 @@ def main():
             pass
         conn.close()
         log.close()
-        print(f"\nLog saved to {OUT}")
+        print(f"\nLog saved to {log_path}")
 
 
 # ======================================================================
-# SAT-detected fill (same logic as run_sunray_v3)
+# SAT-detected fill
 # ======================================================================
 
 def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
                   bboxes, face_types, seed_groups, log):
-    """Run interactive fill for SAT-detected holes. Returns (summary, consumed_set)."""
+    """Run interactive fill for SAT-detected holes.
+
+    Returns (summary, consumed_set, skipped_group_faces, skipped_group_bboxes).
+    """
     from code.models import SessionSummary
 
     summary = SessionSummary()
@@ -180,6 +228,8 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
     groups = seed_groups if seed_groups else [
         {"seeds": [s], "loop_faces": [s]} for s in sorted(seeds)
     ]
+
+    group_bboxes = {}
 
     for gi, group in enumerate(groups):
       try:
@@ -195,12 +245,19 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
 
         group_bb = _union_bbox(loop_faces, bboxes)
         current_ids = set(loop_faces)
+        group_bboxes[gi] = group_bb
 
         try:
             simplifier._highlight_faces(shape_name, sorted(current_ids),
                                         zoom_to_bbox=group_bb)
         except Exception:
             pass
+
+        if group_bb != (0, 0, 0, 0, 0, 0):
+            cx = (group_bb[0] + group_bb[3]) / 2
+            cy = (group_bb[1] + group_bb[4]) / 2
+            cz = (group_bb[2] + group_bb[5]) / 2
+            log.log(f"    WCS origin: ({cx:.2f}, {cy:.2f}, {cz:.2f})")
 
         try:
             action = simplifier._prompt_action()
@@ -220,7 +277,6 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
             summary.skipped += 1
             continue
 
-        # Try fill with expansion
         success = False
         for attempt in range(6):
             sorted_ids = sorted(current_ids)
@@ -261,7 +317,6 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
                     log.log(f"    Expanded: {old} -> {len(current_ids)}")
 
         if not success:
-            # Probe fallback (consecutive ID probing)
             log.log(f"    Trying probe fallback...")
             candidates = simplifier.probe_nearby_ids(
                 shape_name, group_seeds, consumed, max_range=5)
@@ -299,30 +354,30 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
     log.log(f"  Filled={summary.filled}, Skipped={summary.skipped}, "
              f"Failed={summary.failed}")
 
-    # Collect face IDs from groups that were skipped or failed
-    # (not consumed = not successfully filled)
     skipped_group_faces = set()
-    for group in groups:
+    skipped_group_bboxes = {}
+    for gi, group in enumerate(groups):
         group_seeds = group["seeds"]
         if not any(s in consumed for s in group_seeds):
-            # This group was not filled — its faces are candidates for ghost scan
-            skipped_group_faces.update(group["loop_faces"])
-            skipped_group_faces.update(group["seeds"])
+            bb = group_bboxes.get(gi, (0, 0, 0, 0, 0, 0))
+            for fid in group["loop_faces"]:
+                skipped_group_faces.add(fid)
+                if bb != (0, 0, 0, 0, 0, 0):
+                    skipped_group_bboxes[fid] = bb
+            for fid in group["seeds"]:
+                skipped_group_faces.add(fid)
+                if bb != (0, 0, 0, 0, 0, 0):
+                    skipped_group_bboxes[fid] = bb
 
-    return summary, consumed, skipped_group_faces
+    return summary, consumed, skipped_group_faces, skipped_group_bboxes
 
 
 # ======================================================================
-# Ghost face scan — finds holes invisible to the SAT parser
+# Ghost face scan
 # ======================================================================
 
 def _find_ghost_face_ids(face_types, consumed, bboxes):
-    """Find face IDs missing from the SAT export.
-
-    Scans from 1 to max_known_id + 50. Returns sorted list of IDs
-    that are NOT in face_types and NOT already consumed.
-    Board reference faces (2 largest plane faces) are excluded.
-    """
+    """Find face IDs missing from the SAT export."""
     plane_faces = [pid for pid, st in face_types.items() if "plane" in st]
     board_ref = set()
     if plane_faces:
@@ -356,39 +411,32 @@ def _get_board_ref_faces(face_types, bboxes):
     return set(by_area[:2])
 
 
+def _estimate_ghost_bbox(fid, skipped_group_bboxes):
+    """Estimate bbox for a ghost face from nearby skipped SAT group faces."""
+    if fid in skipped_group_bboxes:
+        return skipped_group_bboxes[fid]
+    for offset in range(1, 6):
+        for nearby in [fid + offset, fid - offset]:
+            if nearby in skipped_group_bboxes:
+                return skipped_group_bboxes[nearby]
+    return None
+
+
 def _try_ghost_fill_windows(simplifier, shape_name, seed_fid,
                              consumed, ghost_consumed,
                              skipped_group_faces, log):
-    """Try consecutive ID windows around a ghost face seed.
-
-    Uses _try_fill_hole_silent: RunScript tests silently (no GUI error
-    popups), and only persists via AddToHistory if the test passes.
-
-    First tries windows that include skipped SAT group faces (these are
-    faces from groups that failed/were skipped in the SAT fill phase).
-    Then falls back to plain consecutive windows.
-
-    Tries window sizes 2-6, sliding around the seed face ID.
-    Returns (success, face_list).
-    """
-    # Strategy 1: Try windows that include nearby skipped SAT group faces.
-    # These faces are known to belong to holes but couldn't be filled
-    # during the SAT phase (e.g. Group 34: seeds=[147,148] with wrong
-    # loop_faces). By including them we get the correct complete hole.
+    """Try consecutive ID windows around a ghost face seed."""
     nearby_skipped = sorted(f for f in skipped_group_faces
                             if abs(f - seed_fid) <= 5
                             and f not in consumed
                             and f not in ghost_consumed)
     if nearby_skipped:
-        # Build a combined set: skipped SAT faces + ghost seed + consecutive range
         combined_base = set(nearby_skipped) | {seed_fid}
         cmin, cmax = min(combined_base), max(combined_base)
-        # Fill gaps between min and max
         for fid in range(cmin, cmax + 1):
             if fid not in consumed and fid not in ghost_consumed:
                 combined_base.add(fid)
 
-        # Try the base combined set, then expand by 1, 2 faces on each side
         for extend in range(0, 3):
             combined = set(combined_base)
             for fid in range(cmin - extend, cmax + extend + 1):
@@ -410,7 +458,6 @@ def _try_ghost_fill_windows(simplifier, shape_name, seed_fid,
             if ok:
                 return True, combined_list
 
-    # Strategy 2: Plain consecutive ID windows (sizes 2-5)
     for window in range(2, 6):
         for start in range(seed_fid - window + 1, seed_fid + 1):
             if start <= 0:
@@ -435,23 +482,9 @@ def _try_ghost_fill_windows(simplifier, shape_name, seed_fid,
 
 
 def _run_ghost_face_scan(simplifier, conn, shape_name, face_types, bboxes,
-                          adjacency, consumed, skipped_group_faces, log):
-    """Scan ghost faces one by one, asking user to confirm each.
-
-    Ghost faces have NO face entity in the SAT export, so we cannot use
-    SAT adjacency, surface type, or bbox. CST 2025 also has no working
-    VBA method to extract face bbox/center (GetPickedFaceCenter,
-    Solid.GetFaceBoundingBox both fail with COM errors).
-
-    Strategy: for each ghost face the user confirms as a hole face,
-    try consecutive ID windows (sizes 2-5) around that face ID and
-    go directly to _try_fill_hole (AddToHistory). We skip _test_fill_hole
-    because RunScript modifies the model in memory, which breaks the
-    subsequent AddToHistory fill on the same faces.
-
-    All faces in a successfully filled hole are marked consumed
-    so they won't be asked about again.
-    """
+                          adjacency, consumed, skipped_group_faces,
+                          skipped_group_bboxes, log):
+    """Scan ghost faces one by one, asking user to confirm each."""
     from code.models import SessionSummary
 
     summary = SessionSummary()
@@ -476,7 +509,6 @@ def _run_ghost_face_scan(simplifier, conn, shape_name, face_types, bboxes,
 
         log.log(f"\n  [Ghost face {fid}]")
 
-        # Check if this face still exists by trying to pick it
         try:
             import tempfile
             _out_path = os.path.join(tempfile.gettempdir(), "cst_fill.txt")
@@ -505,13 +537,20 @@ def _run_ghost_face_scan(simplifier, conn, shape_name, face_types, bboxes,
         except Exception:
             pass
 
-        # Highlight this single face in CST
+        ghost_bb = _estimate_ghost_bbox(fid, skipped_group_bboxes)
+
         try:
-            simplifier._highlight_faces(shape_name, [fid])
+            simplifier._highlight_faces(shape_name, [fid],
+                                        zoom_to_bbox=ghost_bb)
         except Exception as exc:
             log.log(f"    Highlight error: {exc}")
 
-        # Ask user
+        if ghost_bb and ghost_bb != (0, 0, 0, 0, 0, 0):
+            cx = (ghost_bb[0] + ghost_bb[3]) / 2
+            cy = (ghost_bb[1] + ghost_bb[4]) / 2
+            cz = (ghost_bb[2] + ghost_bb[5]) / 2
+            log.log(f"    WCS origin (estimated): ({cx:.2f}, {cy:.2f}, {cz:.2f})")
+
         print(f"\n  Ghost face {fid} (not in SAT export)")
         try:
             while True:
@@ -537,7 +576,6 @@ def _run_ghost_face_scan(simplifier, conn, shape_name, face_types, bboxes,
             summary.skipped += 1
             continue
 
-        # User said yes — clear picks and try consecutive windows
         try:
             simplifier._conn.execute_vba(
                 'Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
@@ -554,6 +592,22 @@ def _run_ghost_face_scan(simplifier, conn, shape_name, face_types, bboxes,
             hole_count += 1
             summary.filled += 1
             log.log(f"    -> FILLED ghost hole #{hole_count}: {hole_faces}")
+
+            # Ask if all holes are now filled
+            print(f"\n  Ghost hole filled: {hole_faces}")
+            try:
+                while True:
+                    done = input("  Are all holes filled? (y/n): ").strip().lower()
+                    if done in ("y", "n"):
+                        break
+                    print("  Please enter y or n.")
+            except (EOFError, KeyboardInterrupt):
+                done = "y"
+
+            log.log(f"    All holes filled? {done}")
+            if done == "y":
+                log.log("    Stopping ghost scan (user confirmed all done).")
+                break
         else:
             summary.failed += 1
             log.log(f"    -> FAILED (no window worked for face {fid})")

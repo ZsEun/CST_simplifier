@@ -18,6 +18,11 @@ debug_sat_v5.txt
 debug_export.*
 debug_simplified_*.sat
 
+# Debug scripts (not part of core tool)
+code/debug*.py
+code/test_addtohistory.py
+code/parse_*.py
+
 # CST model data (large binary files)
 cst_simplifier/
 *.cst
