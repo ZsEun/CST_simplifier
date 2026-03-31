@@ -23,25 +23,27 @@ pip install -r code/requirements.txt
 
 ## Quick Start
 
-### PCB Board (screw holes)
+### Combined (recommended — handles multi-component models)
 
 ```bash
-python -m code.run_sunray_v6
+python -m code.run_combined_v1
 ```
 
-### Shield Can (cover — dimples on side walls)
+Auto-classifies components by name:
+- "BOARD" → PCB screw hole removal
+- "COVER" → Shield can cover dimple removal
+- "FRAM" → Shield can frame dimple removal
+- Other → Skipped
+
+Highlights each component, asks for confirmation, then processes with the right algorithm.
+
+### Individual tools
 
 ```bash
-python -m code.run_led_v2
+python -m code.run_sunray_v6      # PCB board only
+python -m code.run_led_v2         # Shield can cover only
+python -m code.run_frame_v1       # Shield can frame only
 ```
-
-### Shield Can (frame — dimples on side walls)
-
-```bash
-python -m code.run_frame_v1
-```
-
-Both prompt for the `.cst` model path and guide you through interactive filling.
 
 ## Project Structure
 
@@ -52,9 +54,10 @@ code/
     simplifier.py        - Progressive hole filling via AddToHistory
     wall_detector.py     - Shield can wall + dimple detection
     models.py            - Data classes
-    run_sunray_v6.py     - PCB simplifier (latest)
-    run_led_v2.py        - Shield can cover simplifier (latest)
-    run_frame_v1.py      - Shield can frame simplifier (latest)
+    run_combined_v1.py   - Combined simplifier (auto-classifies components)
+    run_sunray_v6.py     - PCB simplifier (standalone)
+    run_led_v2.py        - Shield can cover simplifier (standalone)
+    run_frame_v1.py      - Shield can frame simplifier (standalone)
     run_led_v1.py        - Earlier shield can cover version
 ```
 
