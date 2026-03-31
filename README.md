@@ -3,7 +3,8 @@
 Automates detection and removal of holes and dimples in STP-imported CAD models within CST Studio Suite 2025. Two tools:
 
 1. **PCB Board Simplifier** (`run_sunray_v6.py`) — removes screw holes from flat PCB boards
-2. **Shield Can Simplifier** (`run_led_v2.py`) — removes dimples/holes from shield can side walls
+2. **Shield Can Cover Simplifier** (`run_led_v2.py`) — removes dimples/holes from shield can cover side walls
+3. **Shield Can Frame Simplifier** (`run_frame_v1.py`) — removes dimples/holes from shield can frame side walls
 
 Both connect via COM automation, export SAT geometry, parse topology, and fill features using `AddToHistory` + `RemoveSelectedFaces`.
 
@@ -28,10 +29,16 @@ pip install -r code/requirements.txt
 python -m code.run_sunray_v6
 ```
 
-### Shield Can (dimples on side walls)
+### Shield Can (cover — dimples on side walls)
 
 ```bash
 python -m code.run_led_v2
+```
+
+### Shield Can (frame — dimples on side walls)
+
+```bash
+python -m code.run_frame_v1
 ```
 
 Both prompt for the `.cst` model path and guide you through interactive filling.
@@ -46,9 +53,9 @@ code/
     wall_detector.py     - Shield can wall + dimple detection
     models.py            - Data classes
     run_sunray_v6.py     - PCB simplifier (latest)
-    run_led_v2.py        - Shield can simplifier (latest)
-    run_sunray_v3-v5.py  - Earlier PCB versions
-    run_led_v1.py        - Earlier shield can version
+    run_led_v2.py        - Shield can cover simplifier (latest)
+    run_frame_v1.py      - Shield can frame simplifier (latest)
+    run_led_v1.py        - Earlier shield can cover version
 ```
 
 
@@ -62,12 +69,19 @@ code/
 6. Progressive expansion on failure, consecutive ID probe fallback
 7. Ghost face scan for faces missing from SAT export
 
-## Shield Can Simplifier Algorithm
+## Shield Can Cover Simplifier Algorithm
 
-### 1. Wall Detection
+### 1. Wall Detection (Cover)
 - Find top face (largest plane face by bbox area)
 - Walk adjacency: top face → curved corner faces (torus/spline) → perpendicular plane faces
-- These perpendicular planes are the side walls (works for any angle, not just axis-aligned)
+- These perpendicular planes are the side walls (works for any angle)
+
+## Shield Can Frame Simplifier Algorithm
+
+### 1. Wall Detection (Frame)
+- Find bottom face (largest plane face by bbox area)
+- Side walls = all plane faces whose normal is perpendicular to bottom face normal (|dot| ≤ 0.05)
+- Simpler than cover because frame walls don't need adjacency walk
 
 ### 2. Dimple Detection (per wall)
 For each wall, find dimple faces using local UVW coordinate projection:

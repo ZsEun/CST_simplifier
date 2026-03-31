@@ -48,7 +48,7 @@ class RunLog:
 
 
 def _get_project_path():
-    return r"D:\Users\sunze\Desktop\kiro\cst_simplifier\cst_model\Sunray_LED_v3.cst"
+    return r"D:\Users\sunze\Desktop\kiro\cst_simplifier\cst_model\Sunray_LED_v4.cst"
 
 
 def _set_wcs_on_wall(conn, wall):
