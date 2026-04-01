@@ -24,7 +24,20 @@ pip install -r code/requirements.txt
 
 ## Quick Start
 
-### Combined (recommended — handles multi-component models)
+### GUI (recommended)
+
+```bash
+python -m code.gui
+```
+
+Simple GUI with three buttons:
+1. Fill Holes on PCB Board
+2. Simplify Shield Can (Cover + Frame dimples)
+3. Bridge Shield Can Cover-Frame Gap
+
+Browse to your .cst file, click a button. Prompts appear as Yes/No/Quit dialogs. Output log shown in the GUI.
+
+### Combined CLI (handles multi-component models)
 
 ```bash
 python -m code.run_combined_v1
@@ -62,6 +75,7 @@ code/
     run_frame_v1.py      - Shield can frame simplifier (standalone)
     run_contact_check.py - Contact checker (generic, experimental)
     debug_contact_v17_shieldcan.py - Shield can cover-frame bridge (recommended)
+    gui.py               - GUI launcher with Yes/No/Quit buttons
     run_led_v1.py        - Earlier shield can cover version
 ```
 

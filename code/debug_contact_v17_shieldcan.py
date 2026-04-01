@@ -319,7 +319,7 @@ def main():
         extrude_vba = (
             f'With Extrude\n'
             f'  .Reset\n'
-            f'  .Name "bridge_1"\n'
+            f'  .Name "bridge_{int(__import__("time").time()) % 100000}"\n'
             f'  .Component "{parts_f[0]}"\n'
             f'  .Material "PEC"\n'
             f'  .Mode "Picks"\n'
