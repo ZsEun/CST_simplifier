@@ -7,6 +7,7 @@ Automates detection and removal of holes and dimples in STP-imported CAD models 
 3. **Shield Can Frame Simplifier** (`run_frame_v1.py`) — removes dimples/holes from shield can frame side walls
 4. **Shield Can Contact Bridge** (`debug_contact_v17_shieldcan.py`) — detects gap between shield can cover and frame, creates a bridge by extruding the frame's top face to close the gap
 5. **PCB Grounding Bridge** (`debug_pcb_edge_v2.py`) — detects components near the PCB with gaps, bridges them to the PCB by extruding the closest parallel face
+6. **Component Cleanup** (`gui_cleanup.py`) — identifies and deletes plastic/unnecessary components by keyword matching, with auto-delete, exclude lists, and keyword import/export
 
 Both connect via COM automation, export SAT geometry, parse topology, and fill features using `AddToHistory` + `RemoveSelectedFaces`.
 
@@ -78,6 +79,7 @@ code/
     run_contact_check.py - Contact checker (generic, experimental)
     debug_contact_v17_shieldcan.py - Shield can cover-frame bridge (recommended)
     debug_pcb_edge_v2.py     - PCB grounding bridge
+    gui_cleanup.py       - Component cleanup GUI (separate tool)
     gui.py               - GUI launcher with Yes/No/Quit buttons
     run_led_v1.py        - Earlier shield can cover version
 ```
@@ -125,6 +127,24 @@ For each wall, find dimple faces using local UVW coordinate projection:
 - Track consumed faces to avoid duplicate fills
 - For each wall with dimples: set WCS aligned with wall, highlight, ask user, fill via AddToHistory
 - Use silent fill (`_try_fill_hole_silent`) to avoid GUI error popups
+
+## Component Cleanup Tool
+
+Separate GUI tool for removing plastic, rubber, screws, and other non-metal components from imported CAD models.
+
+```bash
+python -m code.gui_cleanup
+```
+
+### Features
+- Three keyword categories: Delete (ask user), Auto-delete (no confirmation), Exclude (never delete)
+- Default keywords: Delete=COVER, Auto-delete=SCREW/RUBBER/MYLAR/ADH/PLASTIC, Exclude=SHIELDING/SPRING
+- Groups similar components (xxx, xxx_1, xxx_2) and processes as a batch
+- Sorts by Zmax (topmost/outermost components first)
+- SelectTreeItem highlights components in CST navigation tree
+- Clickable buttons for adding exclude keywords (no typing needed)
+- Import/Export/Save keyword lists for reuse across projects
+- Auto-deletes empty parent folders after removing all children
 
 ## PCB Grounding Bridge Algorithm
 
