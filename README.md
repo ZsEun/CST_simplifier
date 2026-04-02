@@ -6,6 +6,7 @@ Automates detection and removal of holes and dimples in STP-imported CAD models 
 2. **Shield Can Cover Simplifier** (`run_led_v2.py`) — removes dimples/holes from shield can cover side walls
 3. **Shield Can Frame Simplifier** (`run_frame_v1.py`) — removes dimples/holes from shield can frame side walls
 4. **Shield Can Contact Bridge** (`debug_contact_v17_shieldcan.py`) — detects gap between shield can cover and frame, creates a bridge by extruding the frame's top face to close the gap
+5. **PCB Grounding Bridge** (`debug_pcb_edge_v2.py`) — detects components near the PCB with gaps, bridges them to the PCB by extruding the closest parallel face
 
 Both connect via COM automation, export SAT geometry, parse topology, and fill features using `AddToHistory` + `RemoveSelectedFaces`.
 
@@ -34,6 +35,7 @@ Simple GUI with three buttons:
 1. Fill Holes on PCB Board
 2. Simplify Shield Can (Cover + Frame dimples)
 3. Bridge Shield Can Cover-Frame Gap
+4. Bridge Grounding for PCB
 
 Browse to your .cst file, click a button. Prompts appear as Yes/No/Quit dialogs. Output log shown in the GUI.
 
@@ -75,6 +77,7 @@ code/
     run_frame_v1.py      - Shield can frame simplifier (standalone)
     run_contact_check.py - Contact checker (generic, experimental)
     debug_contact_v17_shieldcan.py - Shield can cover-frame bridge (recommended)
+    debug_pcb_edge_v2.py     - PCB grounding bridge
     gui.py               - GUI launcher with Yes/No/Quit buttons
     run_led_v1.py        - Earlier shield can cover version
 ```
@@ -122,6 +125,25 @@ For each wall, find dimple faces using local UVW coordinate projection:
 - Track consumed faces to avoid duplicate fills
 - For each wall with dimples: set WCS aligned with wall, highlight, ask user, fill via AddToHistory
 - Use silent fill (`_try_fill_hole_silent`) to avoid GUI error popups
+
+## PCB Grounding Bridge Algorithm
+
+Bridges gaps between the PCB and nearby components (e.g. shield can frames, connectors) to ensure electrical grounding contact.
+
+### Algorithm
+1. **Find PCB**: Search components by keywords (BOARD, PCB, MB, MAIN_BOARD). Validate flatness: both plane dimensions must be ≥4x the thickness.
+2. **Establish UVW**: Find the longest straight edge from SAT topology. Build orthonormal UVW: U=edge direction, W=board normal (from largest plane face), V=W×U. Set WCS in CST for visualization.
+3. **Find top/bottom faces**: Two large plane faces with normals along W, spanning ≥80% of PCB in U and V.
+4. **Find nearby components**: For each side of the PCB, find components whose W_min is within 1/4 thickness of the PCB face, entirely on one side (not straddling).
+5. **Check gaps**: For each nearby component, use copy+Solid.Intersect+volume check to confirm no overlap (gap exists).
+6. **Bridge**: Find the closest parallel face on the component, highlight it with WCS at its center, ask user to confirm, then extrude toward the PCB face via AddToHistory.
+7. **Repeat for both sides** of the PCB.
+
+### Key Features
+- Recursive component tree walker (handles any nesting depth)
+- UVW coordinate system aligned with PCB edge (works for non-axis-aligned boards)
+- WCS crosshair at mating face center for easy visual identification
+- WCS restored to PCB center after bridging
 
 ## Shield Can Contact Bridge Algorithm
 

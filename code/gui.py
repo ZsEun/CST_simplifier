@@ -127,6 +127,16 @@ class App:
         )
         self.btn3.pack(side="left", padx=3)
 
+        # Second row of buttons
+        btn_frame2 = tk.Frame(root, padx=10, pady=2)
+        btn_frame2.pack(fill="x")
+
+        self.btn4 = tk.Button(
+            btn_frame2, text="4. Bridge Grounding for PCB",
+            command=lambda: self._run_tool("pcb_bridge"), width=30, height=1,
+        )
+        self.btn4.pack(side="left", padx=3)
+
         # Log area
         log_frame = tk.Frame(root, padx=10, pady=5)
         log_frame.pack(fill="both", expand=True)
@@ -164,6 +174,7 @@ class App:
         self.btn1.config(state=state)
         self.btn2.config(state=state)
         self.btn3.config(state=state)
+        self.btn4.config(state=state)
 
     def _run_tool(self, tool):
         project = self.project_path.get().strip()
@@ -195,6 +206,8 @@ class App:
                 self._run_shieldcan(project)
             elif tool == "bridge":
                 self._run_bridge(project)
+            elif tool == "pcb_bridge":
+                self._run_pcb_bridge(project)
             self.root.after(0, lambda: self.status.set("Done. Ready for next tool."))
         except Exception as exc:
             print(f"\nERROR: {exc}")
@@ -340,6 +353,12 @@ class App:
         import code.debug_contact_v17_shieldcan as bridge_mod
         bridge_mod.PROJECT = project
         bridge_mod.main()
+
+    def _run_pcb_bridge(self, project):
+        """Run PCB grounding bridge."""
+        import code.debug_pcb_edge_v2 as pcb_mod
+        pcb_mod.PROJECT = project
+        pcb_mod.main()
 
 
 def main():
