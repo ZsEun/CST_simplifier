@@ -20,6 +20,10 @@ debug_simplified_*.sat
 
 # Debug scripts (not part of core tool)
 code/debug*.py
+# Exceptions: these debug files are core features
+!code/debug_connector_v2.py
+!code/debug_pcb_edge_v2.py
+!code/debug_contact_v17_shieldcan.py
 code/test_addtohistory.py
 code/parse_*.py
 

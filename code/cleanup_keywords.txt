@@ -1,0 +1,17 @@
+# Delete keywords (ask user)
+COVER
+FACEPLAT
+SPONGE
+FOAM
+
+# Auto-delete keywords (no confirmation)
+SCREW
+RUBBER
+MYLAR
+ADH
+PLASTIC
+CABLE
+
+# Exclude keywords
+SHIELDING
+SPRING

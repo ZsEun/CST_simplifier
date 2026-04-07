@@ -8,6 +8,7 @@ Automates detection and removal of holes and dimples in STP-imported CAD models 
 4. **Shield Can Contact Bridge** (`debug_contact_v17_shieldcan.py`) — detects gap between shield can cover and frame, creates a bridge by extruding the frame's top face to close the gap
 5. **PCB Grounding Bridge** (`debug_pcb_edge_v2.py`) — detects components near the PCB with gaps, bridges them to the PCB by extruding the closest parallel face
 6. **Component Cleanup** (`gui_cleanup.py`) — identifies and deletes plastic/unnecessary components by keyword matching, with auto-delete, exclude lists, and keyword import/export
+7. **Connector Replacement** (`debug_connector_v2.py`) — replaces connector components with PEC blocks, bridges to FPC and PCB, merges bridges, and cleans up overlapping components
 
 Both connect via COM automation, export SAT geometry, parse topology, and fill features using `AddToHistory` + `RemoveSelectedFaces`.
 
@@ -37,6 +38,7 @@ Simple GUI with three buttons:
 2. Simplify Shield Can (Cover + Frame dimples)
 3. Bridge Shield Can Cover-Frame Gap
 4. Bridge Grounding for PCB
+5. Replace Connector
 
 Browse to your .cst file, click a button. Prompts appear as Yes/No/Quit dialogs. Output log shown in the GUI.
 
@@ -79,8 +81,9 @@ code/
     run_contact_check.py - Contact checker (generic, experimental)
     debug_contact_v17_shieldcan.py - Shield can cover-frame bridge (recommended)
     debug_pcb_edge_v2.py     - PCB grounding bridge
+    debug_connector_v2.py    - Connector replacement with FPC/PCB bridging
     gui_cleanup.py       - Component cleanup GUI (separate tool)
-    gui.py               - GUI launcher with Yes/No/Quit buttons
+    gui.py               - GUI launcher (5 buttons)
     run_led_v1.py        - Earlier shield can cover version
 ```
 
@@ -183,6 +186,37 @@ Bridges the gap between shield can cover and frame. Specifically designed for th
 - Only works for shield can cover + frame geometry (flat mating rims)
 - Assumes cover and frame are oriented along a principal axis (X, Y, or Z)
 - Does not handle angled or curved mating surfaces
+
+## Connector Replacement Algorithm
+
+Replaces connector components with PEC blocks and bridges them to FPC and PCB for electrical contact.
+
+```bash
+python -m code.debug_connector_v2
+```
+
+### Algorithm
+1. **Select connector**: User provides name, fuzzy match, SelectTreeItem to confirm
+2. **Analyze geometry**: Find longest straight edge → U axis. Find largest plane face → W axis (board normal). Build UVW coordinate system.
+3. **Create replacement block**: PEC Brick with same global bbox as original connector via AddToHistory
+4. **Find FPC**: Search by keywords (FPC, FLEX, FPCA), check W-axis proximity, user confirms. If no auto-match, manual name entry.
+5. **Check FPC contact**: Find closest parallel FPC face, check if within block's W range. If gap: auto-extrude block face toward FPC.
+6. **Find PCB**: Search by keywords (BOARD, PCB, MB) with 3 filters:
+   - Largest plane face area >= 10x block's plane face area
+   - Largest face normal parallel to W axis (|dot| >= 0.9)
+   - W distance < connector thickness
+7. **Check PCB contact**: Same W-axis method as FPC, auto-bridge if gap.
+8. **Merge bridges**: `Solid.Add` merges FPC/PCB bridges into the main block.
+9. **Delete original**: Remove original connector after user confirmation.
+10. **Clean up overlapping components**: Find components at tree levels n-1 to n whose bbox is within the merged block's bbox. Delete with user confirmation. Repeat with manual input until no more components remain.
+
+### Key Features
+- UVW coordinate system handles non-axis-aligned connectors
+- Three PCB filters eliminate false positives from small keyword-matching components
+- Auto-bridge without confirmation (gaps are always small and unambiguous)
+- >100 candidate handling: ask user to auto-detect or manually input
+- Progress logging during long scans
+- Solid.Add merges bridges into a single block
 
 ## CST 2025 COM API Notes
 

@@ -42,48 +42,69 @@ class GUIWriter:
 
 
 def gui_input(root, prompt):
-    """Replacement for input() that shows a dialog with Yes/No/Quit buttons."""
+    """Replacement for input() — shows text entry for name prompts, Yes/No/Quit for confirmations."""
+    # Detect if this is a text input prompt (contains "Enter" or "name" or "component")
+    is_text_prompt = any(kw in prompt.lower() for kw in ["enter ", "type ", "provide "])
+
     result = [None]
     event = threading.Event()
 
     def _ask():
         dialog = tk.Toplevel(root)
-        dialog.title("Confirm")
+        dialog.title("Input" if is_text_prompt else "Confirm")
         dialog.transient(root)
         dialog.grab_set()
         dialog.resizable(False, False)
 
         tk.Label(dialog, text=prompt, padx=20, pady=10, wraplength=400).pack()
 
-        btn_frame = tk.Frame(dialog, padx=10, pady=10)
-        btn_frame.pack()
+        if is_text_prompt:
+            entry = tk.Entry(dialog, width=40)
+            entry.pack(padx=20, pady=5)
+            entry.focus_set()
 
-        def _yes():
-            result[0] = "y"
-            dialog.destroy()
-            event.set()
+            def _ok():
+                result[0] = entry.get().strip()
+                dialog.destroy()
+                event.set()
 
-        def _no():
-            result[0] = "n"
-            dialog.destroy()
-            event.set()
+            def _skip():
+                result[0] = ""
+                dialog.destroy()
+                event.set()
 
-        def _quit():
-            result[0] = "q"
-            dialog.destroy()
-            event.set()
+            bf = tk.Frame(dialog, padx=10, pady=10); bf.pack()
+            tk.Button(bf, text="OK", command=_ok, width=10, bg="#4CAF50", fg="white").pack(side="left", padx=5)
+            tk.Button(bf, text="Skip", command=_skip, width=10).pack(side="left", padx=5)
+            entry.bind("<Return>", lambda e: _ok())
+        else:
+            btn_frame = tk.Frame(dialog, padx=10, pady=10)
+            btn_frame.pack()
 
-        tk.Button(btn_frame, text="Yes", command=_yes, width=10, bg="#4CAF50", fg="white").pack(side="left", padx=5)
-        tk.Button(btn_frame, text="No", command=_no, width=10).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Quit", command=_quit, width=10, bg="#f44336", fg="white").pack(side="left", padx=5)
+            def _yes():
+                result[0] = "y"
+                dialog.destroy()
+                event.set()
 
-        # Center dialog on parent
+            def _no():
+                result[0] = "n"
+                dialog.destroy()
+                event.set()
+
+            def _quit():
+                result[0] = "q"
+                dialog.destroy()
+                event.set()
+
+            tk.Button(btn_frame, text="Yes", command=_yes, width=10, bg="#4CAF50", fg="white").pack(side="left", padx=5)
+            tk.Button(btn_frame, text="No", command=_no, width=10).pack(side="left", padx=5)
+            tk.Button(btn_frame, text="Quit", command=_quit, width=10, bg="#f44336", fg="white").pack(side="left", padx=5)
+
         dialog.update_idletasks()
         x = root.winfo_x() + (root.winfo_width() - dialog.winfo_width()) // 2
         y = root.winfo_y() + (root.winfo_height() - dialog.winfo_height()) // 2
         dialog.geometry(f"+{x}+{y}")
-
-        dialog.protocol("WM_DELETE_WINDOW", _quit)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: (_quit() if not is_text_prompt else _skip()))
 
     root.after(0, _ask)
     event.wait()
@@ -137,6 +158,12 @@ class App:
         )
         self.btn4.pack(side="left", padx=3)
 
+        self.btn5 = tk.Button(
+            btn_frame2, text="5. Replace Connector",
+            command=lambda: self._run_tool("connector"), width=30, height=1,
+        )
+        self.btn5.pack(side="left", padx=3)
+
         # Log area
         log_frame = tk.Frame(root, padx=10, pady=5)
         log_frame.pack(fill="both", expand=True)
@@ -175,6 +202,7 @@ class App:
         self.btn2.config(state=state)
         self.btn3.config(state=state)
         self.btn4.config(state=state)
+        self.btn5.config(state=state)
 
     def _run_tool(self, tool):
         project = self.project_path.get().strip()
@@ -208,6 +236,8 @@ class App:
                 self._run_bridge(project)
             elif tool == "pcb_bridge":
                 self._run_pcb_bridge(project)
+            elif tool == "connector":
+                self._run_connector(project)
             self.root.after(0, lambda: self.status.set("Done. Ready for next tool."))
         except Exception as exc:
             print(f"\nERROR: {exc}")
@@ -359,6 +389,14 @@ class App:
         import code.debug_pcb_edge_v2 as pcb_mod
         pcb_mod.PROJECT = project
         pcb_mod.main()
+
+    def _run_connector(self, project):
+        """Run connector replacement."""
+        import importlib
+        import code.debug_connector_v2 as conn_mod
+        importlib.reload(conn_mod)
+        conn_mod.PROJECT = project
+        conn_mod.main()
 
 
 def main():
