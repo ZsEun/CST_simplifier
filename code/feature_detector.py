@@ -556,7 +556,10 @@ class FeatureDetector:
         self._conn = connection
 
     def _enumerate_solids(self) -> List[Tuple[str, str]]:
-        """List every (component_name, solid_name) pair in the model."""
+        """List every (component_name, solid_name) pair in the model.
+
+        Uses recursive tree walker (depth limit 10) to handle any nesting depth.
+        """
         out_path = os.path.join(tempfile.gettempdir(), "cst_solids.txt")
         vba_path = out_path.replace("\\", "\\\\")
         macro = (
@@ -564,18 +567,24 @@ class FeatureDetector:
             f'  Open "{vba_path}" For Output As #1\n'
             '  Dim rt As Object\n'
             '  Set rt = Resulttree\n'
+            '  Call WalkTree(rt, "Components", 1)\n'
+            '  Close #1\n'
+            'End Sub\n'
+            '\n'
+            'Sub WalkTree(rt As Object, path As String, depth As Integer)\n'
+            '  If depth > 10 Then Exit Sub\n'
             '  Dim child As String\n'
-            '  child = rt.GetFirstChildName("Components")\n'
+            '  child = rt.GetFirstChildName(path)\n'
             '  Do While child <> ""\n'
             '    Dim subChild As String\n'
             '    subChild = rt.GetFirstChildName(child)\n'
-            '    Do While subChild <> ""\n'
-            '      Print #1, subChild\n'
-            '      subChild = rt.GetNextItemName(subChild)\n'
-            '    Loop\n'
+            '    If subChild = "" Then\n'
+            '      Print #1, child\n'
+            '    Else\n'
+            '      Call WalkTree(rt, child, depth + 1)\n'
+            '    End If\n'
             '    child = rt.GetNextItemName(child)\n'
             '  Loop\n'
-            '  Close #1\n'
             'End Sub\n'
         )
         result = self._conn.execute_vba(macro, output_file=out_path)
@@ -585,15 +594,21 @@ class FeatureDetector:
                 line = line.strip()
                 if not line:
                     continue
-                parts = line.replace("\\", "/").split("/")
-                if len(parts) >= 3:
-                    solids.append((parts[-2], parts[-1]))
+                path = line.replace("\\", "/")
+                if path.startswith("Components/"):
+                    path = path[len("Components/"):]
+                parts = path.split("/")
+                if len(parts) >= 2:
+                    solid = parts[-1]
+                    comp_path = "/".join(parts[:-1])
+                    solids.append((comp_path, solid))
         try:
             os.remove(out_path)
         except OSError:
             pass
         logger.info("Enumerated %d solid shapes.", len(solids))
         return solids
+
 
     def _export_sat(self, component: str, solid: str) -> Optional[str]:
         """Export solid to SAT file and return path, or None on failure."""

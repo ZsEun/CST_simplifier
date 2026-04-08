@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from code.cst_connection import CSTConnection
 from code.feature_detector import FeatureDetector, SATParser
+from code.component_cache import ComponentCache
 
 PROJECT = r"D:\Users\sunze\Desktop\kiro\cst_simplifier\cst_model\Sunray_metal_v3.cst"
 OUT = r"D:\Users\sunze\Desktop\kiro\debug_output.txt"
@@ -152,12 +153,13 @@ def main():
     try:
         conn.connect(); conn.open_project(PROJECT)
         log(f"Opened: {PROJECT}")
+        cache = ComponentCache(PROJECT)
         det = FeatureDetector(conn)
         components = list_components(conn)
 
         # ── Step 1: Select connector ──
         log(f"\n=== Step 1: Select connector ===")
-        connector_name = input("Enter connector component name: ").strip()
+        connector_name = input("Enter the connector component name: ").strip()
         if not connector_name: log("No name."); return
 
         matches = [c for c in components if connector_name.upper() in c["shape"].upper()]
@@ -169,7 +171,7 @@ def main():
             selected = matches[0]
         log(f"Selected: {selected['shape']}")
         conn.execute_vba(f'Sub Main\n  SelectTreeItem("{selected["raw"]}")\n  Plot.ZoomToStructure\nEnd Sub\n')
-        if input("Correct connector? (y/n): ").strip().lower() != "y": return
+        if input("Is this the correct connector? (y/n): ").strip().lower() != "y": return
 
         # ── Step 2: Analyze geometry ──
         log(f"\n=== Step 2: Analyze geometry ===")
@@ -226,31 +228,42 @@ def main():
 
         # ── Step 4: Find FPC and check contact ──
         log(f"\n=== Step 4: Find FPC ===")
-        FPC_KW = ["FPC", "FLEX", "FPCA"]
-        fpc_candidates = []
-        for c in components:
-            if c["shape"] == selected["shape"] or c["shape"] == new_shape: continue
-            if any(kw in c["solid"].upper() for kw in FPC_KW):
-                fpc_candidates.append(c)
-        log(f"  FPC keyword matches: {len(fpc_candidates)}")
-
         fpc_selected = None
-        for fc in fpc_candidates:
-            conn.execute_vba(f'Sub Main\n  SelectTreeItem("{fc["raw"]}")\n  Plot.ZoomToStructure\nEnd Sub\n')
-            ok = input(f"  Is '{fc['solid']}' the FPC? (y/n): ").strip().lower()
-            if ok == "y": fpc_selected = fc; break
+        cached_fpc = cache.get("fpc")
+        if cached_fpc:
+            fm = [c for c in components if c["shape"] == cached_fpc]
+            if fm:
+                conn.execute_vba(f'Sub Main\n  SelectTreeItem("{fm[0]["raw"]}")\n  Plot.ZoomToStructure\nEnd Sub\n')
+                ok = input(f"  Found cached FPC: '{fm[0]['solid']}'. Use this FPC? (y/n): ").strip().lower()
+                if ok == "y":
+                    fpc_selected = fm[0]
 
         if not fpc_selected:
-            fpc_name = input("  Enter FPC name manually (or Enter to skip): ").strip()
-            if fpc_name:
-                fm = [c for c in components if fpc_name.upper() in c["shape"].upper()]
-                if fm:
-                    if len(fm) == 1: fpc_selected = fm[0]
-                    else:
-                        for i, m in enumerate(fm[:10]): log(f"    [{i+1}] {m['solid']}")
-                        fpc_selected = fm[int(input(f"    Enter selection: ")) - 1]
+            FPC_KW = ["FPC", "FLEX", "FPCA"]
+            fpc_candidates = []
+            for c in components:
+                if c["shape"] == selected["shape"] or c["shape"] == new_shape: continue
+                if any(kw in c["solid"].upper() for kw in FPC_KW):
+                    fpc_candidates.append(c)
+            log(f"  FPC keyword matches: {len(fpc_candidates)}")
+
+            for fc in fpc_candidates:
+                conn.execute_vba(f'Sub Main\n  SelectTreeItem("{fc["raw"]}")\n  Plot.ZoomToStructure\nEnd Sub\n')
+                ok = input(f"  Is '{fc['solid']}' the correct FPC? (y/n): ").strip().lower()
+                if ok == "y": fpc_selected = fc; break
+
+            if not fpc_selected:
+                fpc_name = input("  FPC not found automatically. Enter the FPC component name (or Enter to skip): ").strip()
+                if fpc_name:
+                    fm = [c for c in components if fpc_name.upper() in c["shape"].upper()]
+                    if fm:
+                        if len(fm) == 1: fpc_selected = fm[0]
+                        else:
+                            for i, m in enumerate(fm[:10]): log(f"    [{i+1}] {m['solid']}")
+                            fpc_selected = fm[int(input(f"    Enter selection: ")) - 1]
 
         if fpc_selected:
+            cache.set("fpc", fpc_selected["shape"])
             log(f"  FPC: {fpc_selected['solid']}")
 
             # ── New overlap check ──
@@ -357,76 +370,85 @@ def main():
         log(f"\n=== Step 4c: Find PCB ===")
         block_plane_area = (uvw[1]-uvw[0]) * (uvw[3]-uvw[2])  # U_span * V_span
         log(f"  Block plane area (U×V): {block_plane_area:.4f}")
-        PCB_KW = ["BOARD", "PCB", "MB", "MAIN_BOARD"]
-
-        # Count keyword matches first (cheap) before expensive SAT exports
-        pcb_kw_matches = [c for c in components
-            if c["shape"] != selected["shape"] and c["shape"] != new_shape
-            and any(kw in c["solid"].upper() for kw in PCB_KW)]
-        log(f"  PCB keyword matches: {len(pcb_kw_matches)}")
-
-        skip_auto = False
-        if len(pcb_kw_matches) > 100:
-            choice = input(f"  {len(pcb_kw_matches)} PCB keyword matches found. Auto-detect may be slow. Wait for auto-detect? (y/n): ").strip().lower()
-            if choice != "y":
-                skip_auto = True
-
-        pcb_candidates = []
-        if not skip_auto:
-            for c in pcb_kw_matches:
-                c_parts_pcb = c["shape"].split(":")
-                try:
-                    c_sat = det._export_sat(c_parts_pcb[0], c_parts_pcb[1])
-                    if not c_sat: continue
-                    c_sp = SATParser(c_sat); c_faces = c_sp.parse(); c_bbs = c_sp.get_bounding_boxes()
-                    if not c_bbs: continue
-                    # Filter 1: largest plane face area >= 10x block's plane face
-                    best_face_area = 0; best_face_normal = None
-                    for cpid, cinfo in c_faces.items():
-                        if cinfo["surface_type"] != "plane-surface": continue
-                        cbb = c_bbs.get(cpid)
-                        if not cbb: continue
-                        cdims = sorted([cbb[3]-cbb[0], cbb[4]-cbb[1], cbb[5]-cbb[2]], reverse=True)
-                        a = cdims[0]*cdims[1]
-                        if a > best_face_area:
-                            best_face_area = a
-                            cn = cinfo.get("geometry",{}).get("normal")
-                            best_face_normal = _normalize(cn) if cn else None
-                    if best_face_area < block_plane_area * 10:
-                        continue
-                    # Filter 2: largest face normal parallel to W axis (|dot| >= 0.9)
-                    if not best_face_normal or abs(_dot(best_face_normal, w_axis)) < 0.9:
-                        continue
-                    # Filter 3: W distance < connector thickness
-                    c_bb = compute_union_bbox(c_bbs)
-                    c_uvw = project_bbox(c_bb, u_axis, v_axis, w_axis, center)
-                    w_dist = min(abs(c_uvw[4] - w_bot), abs(c_uvw[4] - w_top),
-                                 abs(c_uvw[5] - w_bot), abs(c_uvw[5] - w_top))
-                    if w_dist >= w_span:
-                        continue
-                    pcb_candidates.append((c, w_dist))
-                    log(f"  PCB candidate: {c['solid']} (W dist={w_dist:.4f}, face area={best_face_area:.2f})")
-                except: continue
 
         pcb_selected = None
-        if pcb_candidates:
-            pcb_candidates.sort(key=lambda x: x[1])
-            for pc, pd in pcb_candidates:
-                conn.execute_vba(f'Sub Main\n  SelectTreeItem("{pc["raw"]}")\n  Plot.ZoomToStructure\nEnd Sub\n')
-                ok = input(f"  Is '{pc['solid']}' the PCB? (y/n): ").strip().lower()
-                if ok == "y": pcb_selected = pc; break
+        cached_pcb = cache.get("pcb")
+        if cached_pcb:
+            pm = [c for c in components if c["shape"] == cached_pcb]
+            if pm:
+                conn.execute_vba(f'Sub Main\n  SelectTreeItem("{pm[0]["raw"]}")\n  Plot.ZoomToStructure\nEnd Sub\n')
+                ok = input(f"  Found cached PCB: '{pm[0]['solid']}'. Use this PCB? (y/n): ").strip().lower()
+                if ok == "y":
+                    pcb_selected = pm[0]
 
         if not pcb_selected:
-            pcb_name = input("  Enter PCB name manually (or Enter to skip): ").strip()
-            if pcb_name:
-                pm = [c for c in components if pcb_name.upper() in c["shape"].upper()]
-                if pm:
-                    if len(pm) == 1: pcb_selected = pm[0]
-                    else:
-                        for i, m in enumerate(pm[:10]): log(f"    [{i+1}] {m['solid']}")
-                        pcb_selected = pm[int(input(f"    Enter selection: ")) - 1]
+            PCB_KW = ["BOARD", "PCB", "MB", "MAIN_BOARD"]
+
+            # Count keyword matches first (cheap) before expensive SAT exports
+            pcb_kw_matches = [c for c in components
+                if c["shape"] != selected["shape"] and c["shape"] != new_shape
+                and any(kw in c["solid"].upper() for kw in PCB_KW)]
+            log(f"  PCB keyword matches: {len(pcb_kw_matches)}")
+
+            skip_auto = False
+            if len(pcb_kw_matches) > 100:
+                choice = input(f"  Trying to find PCB components. {len(pcb_kw_matches)} potential candidates found, may take a long time to identify. Continue auto-detect? (y=auto / n=input name manually): ").strip().lower()
+                if choice != "y":
+                    skip_auto = True
+
+            pcb_candidates = []
+            if not skip_auto:
+                for c in pcb_kw_matches:
+                    c_parts_pcb = c["shape"].split(":")
+                    try:
+                        c_sat = det._export_sat(c_parts_pcb[0], c_parts_pcb[1])
+                        if not c_sat: continue
+                        c_sp = SATParser(c_sat); c_faces = c_sp.parse(); c_bbs = c_sp.get_bounding_boxes()
+                        if not c_bbs: continue
+                        best_face_area = 0; best_face_normal = None
+                        for cpid, cinfo in c_faces.items():
+                            if cinfo["surface_type"] != "plane-surface": continue
+                            cbb = c_bbs.get(cpid)
+                            if not cbb: continue
+                            cdims = sorted([cbb[3]-cbb[0], cbb[4]-cbb[1], cbb[5]-cbb[2]], reverse=True)
+                            a = cdims[0]*cdims[1]
+                            if a > best_face_area:
+                                best_face_area = a
+                                cn = cinfo.get("geometry",{}).get("normal")
+                                best_face_normal = _normalize(cn) if cn else None
+                        if best_face_area < block_plane_area * 10:
+                            continue
+                        if not best_face_normal or abs(_dot(best_face_normal, w_axis)) < 0.9:
+                            continue
+                        c_bb = compute_union_bbox(c_bbs)
+                        c_uvw = project_bbox(c_bb, u_axis, v_axis, w_axis, center)
+                        w_dist = min(abs(c_uvw[4] - w_bot), abs(c_uvw[4] - w_top),
+                                     abs(c_uvw[5] - w_bot), abs(c_uvw[5] - w_top))
+                        if w_dist >= w_span:
+                            continue
+                        pcb_candidates.append((c, w_dist))
+                        log(f"  PCB candidate: {c['solid']} (W dist={w_dist:.4f}, face area={best_face_area:.2f})")
+                    except: continue
+
+            if pcb_candidates:
+                pcb_candidates.sort(key=lambda x: x[1])
+                for pc, pd in pcb_candidates:
+                    conn.execute_vba(f'Sub Main\n  SelectTreeItem("{pc["raw"]}")\n  Plot.ZoomToStructure\nEnd Sub\n')
+                    ok = input(f"  Is '{pc['solid']}' the correct PCB? (y/n): ").strip().lower()
+                    if ok == "y": pcb_selected = pc; break
+
+            if not pcb_selected:
+                pcb_name = input("  PCB not found automatically. Enter the PCB component name (or Enter to skip): ").strip()
+                if pcb_name:
+                    pm = [c for c in components if pcb_name.upper() in c["shape"].upper()]
+                    if pm:
+                        if len(pm) == 1: pcb_selected = pm[0]
+                        else:
+                            for i, m in enumerate(pm[:10]): log(f"    [{i+1}] {m['solid']}")
+                            pcb_selected = pm[int(input(f"    Enter selection: ")) - 1]
 
         if pcb_selected:
+            cache.set("pcb", pcb_selected["shape"])
             log(f"  PCB: {pcb_selected['solid']}")
 
             # Same W-axis overlap check as FPC
@@ -536,7 +558,7 @@ def main():
 
         # ── Step 5: Delete original connector ──
         log(f"\n=== Step 5: Delete original ===")
-        ok = input(f"  Delete original connector '{selected['solid']}'? (y/n): ").strip().lower()
+        ok = input(f"  Delete the original connector '{selected['solid']}'? This cannot be undone. (y/n): ").strip().lower()
         if ok == "y":
             r = run_vba(conn, (
                 'Sub Main\n'
@@ -573,7 +595,7 @@ def main():
                     total = len(search_comps)
                     for i, c in enumerate(search_comps):
                         if c["shape"] in exclude_shapes: continue
-                        if total > 20 and (i+1) % 10 == 0:
+                        if total > 50 and (i+1) % 50 == 0:
                             log(f"    Scanning... {i+1}/{total}")
                         cp = c["shape"].split(":")
                         try:
@@ -592,7 +614,7 @@ def main():
                     n = len(search_comps)
                     log(f"  {label}{n} candidates to scan...")
                     if n > 100:
-                        choice = input(f"  {n} components to scan (may be slow). Auto-detect? (y/n): ").strip().lower()
+                        choice = input(f"  Trying to find overlapping components. {n} potential candidates found, may take a long time.\n  Continue auto-detect or skip to manual input? (y=auto / n=manual): ").strip().lower()
                         if choice != "y":
                             return  # user will provide names manually in the loop
                     found = find_overlapping(search_comps, ref_bb, exclude_shapes)
@@ -609,7 +631,7 @@ def main():
                     log(f"  Found {len(found_list)} overlapping components:")
                     for fc in found_list:
                         log(f"    {fc['solid']}")
-                    ok = input(f"  Delete these {len(found_list)} components? (y/n): ").strip().lower()
+                    ok = input(f"  Found {len(found_list)} overlapping components. Delete them all? (y/n): ").strip().lower()
                     if ok == "y":
                         for fc in found_list:
                             r = run_vba(conn, (
@@ -644,10 +666,10 @@ def main():
                 # Make block invisible by selecting it (CST shows others transparent)
 
                 while True:
-                    more = input("  Any more components to delete? (y/n): ").strip().lower()
+                    more = input("  Are there any more components that need to be deleted? (y/n): ").strip().lower()
                     if more != "y":
                         break
-                    extra_name = input("  Enter component name to search around: ").strip()
+                    extra_name = input("  Enter the component name to delete: ").strip()
                     if not extra_name:
                         break
                     # Find the component
@@ -668,7 +690,7 @@ def main():
                     components = list_components(conn)  # refresh after deletions
                     still_exists = any(c["shape"] == target["shape"] for c in components)
                     if still_exists:
-                        ok2 = input(f"  '{target['solid']}' still exists. Delete it? (y/n): ").strip().lower()
+                        ok2 = input(f"  '{target['solid']}' was not found in the auto-scan but still exists. Delete it directly? (y/n): ").strip().lower()
                         if ok2 == "y":
                             r = run_vba(conn, (
                                 'Sub Main\n'

@@ -24,6 +24,9 @@ from code.cst_connection import CSTConnection, CSTConnectionError
 from code.feature_detector import FeatureDetector
 from code.simplifier import Simplifier
 
+# Can be set externally (e.g. by GUI) before calling main()
+PROJECT = None
+
 
 class RunLog:
     """Real-time logger that writes to both console and file."""
@@ -62,9 +65,12 @@ def _union_bbox(face_ids, bboxes):
 
 
 def _get_project_path() -> str:
-    """Ask user for the .cst model path. Supports command-line arg too."""
-    # Check command-line argument first
-    if len(sys.argv) > 1:
+    """Ask user for the .cst model path. Supports PROJECT variable, command-line arg, or interactive input."""
+    global PROJECT
+    # Check PROJECT variable first (set by GUI)
+    if PROJECT:
+        path = PROJECT
+    elif len(sys.argv) > 1:
         path = sys.argv[1].strip().strip('"').strip("'")
     else:
         print("=" * 60)
@@ -96,12 +102,13 @@ def main():
     # Place log file next to the .cst file
     log_dir = os.path.dirname(project_path)
     model_name = os.path.splitext(os.path.basename(project_path))[0]
-    log_path = os.path.join(log_dir, f"{model_name}_simplifier_log.txt")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"{model_name}_simplifier_log_{timestamp}.txt")
 
     log = RunLog(log_path)
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
@@ -115,30 +122,64 @@ def main():
         # --- Detection phase ---
         log.log("\n--- DETECTION PHASE ---")
         detector = FeatureDetector(conn)
-        solid_data = detector.detect_seeds()
+        all_solids = detector._enumerate_solids()
+        log.log(f"Total solids in model: {len(all_solids)}")
 
-        if not solid_data:
-            log.log("No hole candidates found.")
+        # Ask user for the PCB component name directly
+        pcb_name = input("Enter the PCB component name to fill holes on: ").strip()
+        if not pcb_name:
+            log.log("No name provided.")
             return
 
-        for data in solid_data:
-            shape = data["shape_name"]
-            seeds = data["seeds"]
-            groups = data.get("seed_groups", [])
-            face_types = data["face_types"]
+        # Fuzzy match
+        matches = [(c, s) for c, s in all_solids if pcb_name.upper() in f"{c}:{s}".upper()]
+        if not matches:
+            log.log(f"No match for '{pcb_name}'")
+            return
 
-            total_faces = len(face_types)
-            cone_count = sum(1 for st in face_types.values() if "cone" in st)
-            plane_count = sum(1 for st in face_types.values() if "plane" in st)
+        if len(matches) > 1:
+            print(f"  Multiple matches found:")
+            for i, (c, s) in enumerate(matches[:20]):
+                print(f"    [{i+1}] {c}:{s}")
+            idx = int(input(f"  Enter selection (1-{min(len(matches), 20)}): ")) - 1
+            board_solids = [matches[idx]]
+        else:
+            board_solids = matches
 
-            log.log(f"\nSolid: {shape}")
-            log.log(f"  Total faces parsed: {total_faces}")
-            log.log(f"  Cone: {cone_count}, Plane: {plane_count}")
-            log.log(f"  Seeds: {len(seeds)}, Groups: {len(groups)}")
+        # Highlight in CST and confirm
+        comp, solid = board_solids[0]
+        shape_name = f"{comp}:{solid}"
+        tree_path = f"Components\\{comp.replace('/', chr(92))}\\{solid}"
+        try:
+            conn.execute_vba(f'Sub Main\n  SelectTreeItem("{tree_path}")\n  Plot.ZoomToStructure\nEnd Sub\n')
+        except: pass
+        ok = input(f"  Selected: {solid}. Is this the correct PCB? (y/n): ").strip().lower()
+        if ok != "y":
+            log.log("PCB selection rejected.")
+            return
 
-            for i, g in enumerate(groups):
-                log.log(f"  Group {i+1}: seeds={g['seeds']}, "
-                         f"loop={g['loop_faces']} ({len(g['loop_faces'])} faces)")
+        # Analyze the selected component
+        log.log(f"\nAnalyzing: {shape_name}")
+        solid_data = []
+        analysis = detector.analyze_solid(comp, solid)
+        if not analysis:
+            log.log("SAT analysis failed for this component.")
+            return
+        faces, adjacency, bboxes = analysis
+        face_types = {pid: info["surface_type"] for pid, info in faces.items()}
+        seeds = [pid for pid, st in face_types.items() if "cone" in st]
+        seeds = detector._filter_edge_fillets(seeds, faces, face_types, adjacency, bboxes)
+        if not seeds:
+            log.log("No hole candidates (cone faces) found in this component.")
+            return
+        seed_groups = detector._group_seeds_by_loop(seeds, face_types, adjacency, bboxes)
+        solid_data.append({
+            "component": comp, "solid": solid,
+            "shape_name": shape_name,
+            "seeds": sorted(seeds), "seed_groups": seed_groups,
+            "face_types": face_types, "adjacency": adjacency, "bboxes": bboxes,
+        })
+        log.log(f"  Found {len(seeds)} seed faces in {len(seed_groups)} groups")
 
         # --- Fill phase (SAT-detected holes) ---
         log.log("\n--- FILL PHASE (SAT-detected) ---")
@@ -192,8 +233,11 @@ def main():
         log.log(f"\nCST ERROR: {exc}")
         log.log(traceback.format_exc())
     except Exception as exc:
-        log.log(f"\nUNEXPECTED ERROR: {exc}")
-        log.log(traceback.format_exc())
+        if str(exc) == "User quit" or type(exc).__name__ == "UserQuitException":
+            log.log("\nUser quit.")
+        else:
+            log.log(f"\nUNEXPECTED ERROR: {exc}")
+            log.log(traceback.format_exc())
     finally:
         # Reset WCS back to global origin
         try:
@@ -263,12 +307,10 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
             action = simplifier._prompt_action()
         except (EOFError, KeyboardInterrupt):
             log.log(f"    -> INPUT INTERRUPTED")
-            break
+            raise RuntimeError("User quit")
 
         log.log(f"    User action: {action}")
-        if action == "q":
-            break
-        elif action == "n":
+        if action == "n":
             try:
                 simplifier._conn.execute_vba(
                     'Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
@@ -291,9 +333,10 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
 
             hole_count += 1
             try:
-                ok, msg = simplifier._try_fill_hole(
+                ok, msg = simplifier._try_fill_hole_silent(
                     shape_name, sorted_ids, hole_count)
             except Exception as exc:
+                if str(exc) == "User quit" or type(exc).__name__ == "UserQuitException": raise
                 ok = False
                 msg = str(exc)
 
@@ -326,9 +369,10 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
                 hole_count += 1
                 log.log(f"    Probe {ci}: {candidate}")
                 try:
-                    ok, msg = simplifier._try_fill_hole(
+                    ok, msg = simplifier._try_fill_hole_silent(
                         shape_name, candidate, hole_count)
                 except Exception as exc:
+                    if str(exc) == "User quit" or type(exc).__name__ == "UserQuitException": raise
                     ok = False
                     msg = str(exc)
                 log.log(f"    Probe result: ok={ok}")
@@ -346,6 +390,7 @@ def _run_sat_fill(simplifier, shape_name, seeds, adjacency,
             log.log(f"    -> FAILED")
 
       except Exception as exc:
+        if str(exc) == "User quit" or type(exc).__name__ == "UserQuitException": raise
         log.log(f"    -> ERROR: {exc}")
         log.log(traceback.format_exc())
         summary.failed += 1

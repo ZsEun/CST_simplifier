@@ -40,7 +40,7 @@ Simple GUI with three buttons:
 4. Bridge Grounding for PCB
 5. Replace Connector
 
-Browse to your .cst file, click a button. Prompts appear as Yes/No/Quit dialogs. Output log shown in the GUI.
+Browse to your .cst file, click a button. Prompts appear as Yes/No/Quit dialogs (Quit stops the entire tool immediately). Output log shown in the GUI. Each run saves a timestamped log file next to the .cst project.
 
 ### Combined CLI (handles multi-component models)
 
@@ -84,19 +84,25 @@ code/
     debug_connector_v2.py    - Connector replacement with FPC/PCB bridging
     gui_cleanup.py       - Component cleanup GUI (separate tool)
     gui.py               - GUI launcher (5 buttons)
+    component_cache.py   - Shared component cache (PCB/FPC names across tool runs)
     run_led_v1.py        - Earlier shield can cover version
 ```
 
 
 ## PCB Board Simplifier Algorithm
 
-1. Export SAT, parse face types/adjacency/bboxes
-2. Find cone-surface seed faces (screw hole walls)
-3. Filter out board-edge fillets (span ≥50% of board in both in-plane axes)
-4. Group seeds into holes via BFS adjacency walk
-5. For each hole: highlight, ask y/n/q, fill via AddToHistory
-6. Progressive expansion on failure, consecutive ID probe fallback
-7. Ghost face scan for faces missing from SAT export
+Validated on Sunray_metal_v4_fun1.
+
+1. User provides the PCB component name directly (no auto-scan)
+2. Fuzzy match against all solids, list multiple matches, SelectTreeItem to confirm
+3. Export SAT, parse face types/adjacency/bboxes
+4. Find cone-surface seed faces (screw hole walls)
+5. Filter out board-edge fillets (span ≥50% of board in both in-plane axes)
+6. Group seeds into holes via BFS adjacency walk
+7. For each hole: highlight, move WCS crosshair to hole center, ask y/n/q, fill via silent RunScript
+8. Progressive expansion on failure, consecutive ID probe fallback
+9. Ghost face scan for faces missing from SAT export
+10. All fill operations use RunScript with On Error Resume Next (no CST GUI error popups)
 
 ## Shield Can Cover Simplifier Algorithm
 

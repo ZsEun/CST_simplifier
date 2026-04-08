@@ -219,27 +219,36 @@ class Simplifier:
                                hole_index: int) -> Tuple[bool, str]:
         """Try to fill a hole silently — no CST GUI error popups.
 
-        Strategy:
-        1. Pick all faces via AddToHistory (picks always succeed, no popup)
-        2. Attempt RemoveSelectedFaces via RunScript (silent — On Error
-           Resume Next catches failures without GUI popups)
-        3. If RunScript succeeded, record the remove in history via
-           AddToHistory so the change persists across model rebuilds
-        4. If RunScript failed, clear picks via AddToHistory and return False
-
-        This avoids the GUI error popups that occur when AddToHistory
-        directly executes a failing RemoveSelectedFaces.
-
-        Returns:
-            (success, message) tuple
+        All operations use RunScript with On Error Resume Next to avoid
+        any CST GUI error popups. AddToHistory is only called after
+        confirming success.
         """
-        # Step 1: Pick each face via AddToHistory (always succeeds)
-        for fid in face_ids:
-            pick_code = f'Pick.PickFaceFromId "{shape_name}", "{fid}"'
-            result = self._add_to_history("pick face", pick_code)
-            if "HIST_ERR" in (result or ""):
-                self._add_to_history("clear picks", "Pick.ClearAllPicks")
-                return False, f"Pick failed for face {fid}: {result}"
+        # Step 1: Pick all faces via RunScript (silent, no popup on invalid face)
+        pick_lines = "\n".join(
+            f'  Pick.PickFaceFromId "{shape_name}", "{fid}"'
+            for fid in face_ids
+        )
+        pick_code = (
+            'Sub Main\n'
+            f'  Open "{self._out_vba}" For Output As #1\n'
+            '  On Error Resume Next\n'
+            '  Pick.ClearAllPicks\n'
+            f'{pick_lines}\n'
+            '  If Err.Number <> 0 Then\n'
+            '    Print #1, "PICK_FAIL"\n'
+            '    Err.Clear\n'
+            '  Else\n'
+            '    Print #1, "PICK_OK"\n'
+            '  End If\n'
+            '  Close #1\n'
+            'End Sub\n'
+        )
+        result = self._run_vba(pick_code)
+        if "PICK_OK" not in (result or ""):
+            try:
+                self._conn.execute_vba('Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
+            except: pass
+            return False, f"Pick failed: {result}"
 
         # Step 2: Try RemoveSelectedFaces via RunScript (silent)
         test_code = (
@@ -263,21 +272,18 @@ class Simplifier:
         result = self._run_vba(test_code)
 
         if "OK" not in (result or ""):
-            # Remove failed — clear picks and abort
-            self._add_to_history("clear picks", "Pick.ClearAllPicks")
+            # Remove failed — clear picks
+            try:
+                self._conn.execute_vba('Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
+            except: pass
             return False, f"Silent remove failed: {result}"
 
-        # Step 3: RunScript succeeded — model is modified in memory.
-        # The picks are already recorded in history from step 1.
-        # We skip recording RemoveSelectedFaces via AddToHistory here
-        # because the faces are already gone and AddToHistory would
-        # show a GUI error popup trying to re-execute it.
-        # The model change persists when the project is saved.
+        # Step 3: Success — clear picks
+        try:
+            self._conn.execute_vba('Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
+        except: pass
 
-        # Step 4: Clear picks
-        self._add_to_history("clear picks", "Pick.ClearAllPicks")
-
-        return True, f"Silent fill OK: {face_ids}"
+        return True, f"pick {face_ids[0]}: OK; remove: OK"
 
 
     def probe_nearby_ids(
@@ -588,13 +594,14 @@ class Simplifier:
                       f"({len(loop_faces)} face(s))")
                 if bb_info:
                     print(bb_info)
+                    print(f"  (WCS crosshair is centered on this hole for easy identification)")
                 try:
                     action = self._prompt_action()
                 except (EOFError, KeyboardInterrupt):
                     print("\n  Input interrupted, stopping.")
                     break
                 if action == "q":
-                    break
+                    raise RuntimeError("User quit")
                 elif action == "n":
                     # Clear picks before moving to next group
                     try:
@@ -621,11 +628,12 @@ class Simplifier:
 
                 hole_count += 1
                 try:
-                    ok, msg = self._try_fill_hole(shape_name, sorted_ids, hole_count)
+                    ok, msg = self._try_fill_hole_silent(shape_name, sorted_ids, hole_count)
                 except CSTConnectionError as exc:
                     ok = False
                     msg = f"CST error: {exc}"
                 except Exception as exc:
+                    if type(exc).__name__ == "UserQuitException" or str(exc) == "User quit": raise
                     ok = False
                     msg = f"Unexpected error: {exc}"
                 logger.info("  Result: %s", msg)
@@ -670,9 +678,10 @@ class Simplifier:
                         except Exception:
                             pass
                     try:
-                        ok, msg = self._try_fill_hole(
+                        ok, msg = self._try_fill_hole_silent(
                             shape_name, candidate, hole_count)
                     except Exception as exc:
+                        if type(exc).__name__ == "UserQuitException" or str(exc) == "User quit": raise
                         ok = False
                         msg = f"Probe error: {exc}"
                     if ok:
@@ -690,6 +699,7 @@ class Simplifier:
                 print(f"  Could not remove hole at group {sorted(group_seeds)}")
 
           except Exception as exc:
+            if type(exc).__name__ == "UserQuitException" or str(exc) == "User quit": raise
             logger.error("Error processing group %s: %s",
                          group.get("seeds", "?"), exc)
             print(f"  Error on group {group.get('seeds', '?')}: {exc}")
@@ -745,10 +755,12 @@ class Simplifier:
 
     @staticmethod
     def _prompt_action() -> str:
-        """Prompt for y / n / q."""
+        """Prompt for y / n / q. Raises RuntimeError on quit to stop entire process."""
         while True:
-            choice = input("  Fill this hole? (y/n/q): ").strip().lower()
-            if choice in ("y", "n", "q"):
+            choice = input("  Fill this hole? WCS crosshair is centered on it for easy identification. (y/n/q): ").strip().lower()
+            if choice == "q":
+                raise RuntimeError("User quit")
+            if choice in ("y", "n"):
                 return choice
             print("  Invalid input. Please enter 'y', 'n', or 'q'.")
 

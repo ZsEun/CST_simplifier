@@ -20,6 +20,11 @@ from tkinter import messagebox, filedialog, simpledialog
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+class UserQuitException(Exception):
+    """Raised when user clicks Quit in a dialog."""
+    pass
+
+
 class GUIWriter:
     """Redirects print() output to a tkinter Text widget."""
 
@@ -108,6 +113,8 @@ def gui_input(root, prompt):
 
     root.after(0, _ask)
     event.wait()
+    if result[0] == "q":
+        raise UserQuitException("User clicked Quit")
     return result[0]
 
 
@@ -239,6 +246,18 @@ class App:
             elif tool == "connector":
                 self._run_connector(project)
             self.root.after(0, lambda: self.status.set("Done. Ready for next tool."))
+        except UserQuitException:
+            print("\nUser quit.")
+            self.root.after(0, lambda: self.status.set("Stopped by user. Ready for next tool."))
+        except RuntimeError as exc:
+            if "User quit" in str(exc):
+                print("\nUser quit.")
+                self.root.after(0, lambda: self.status.set("Stopped by user. Ready for next tool."))
+            else:
+                print(f"\nERROR: {exc}")
+                import traceback
+                print(traceback.format_exc())
+                self.root.after(0, lambda: self.status.set(f"Error: {exc}"))
         except Exception as exc:
             print(f"\nERROR: {exc}")
             import traceback
@@ -258,34 +277,11 @@ class App:
 
     def _run_pcb(self, project):
         """Run PCB board hole filler."""
-        from code.feature_detector import FeatureDetector
-        from code.simplifier import Simplifier
-
-        conn = self._connect(project)
-        try:
-            det = FeatureDetector(conn)
-            solid_data = det.detect_seeds()
-            simplifier = Simplifier(conn)
-
-            found = False
-            for data in solid_data:
-                name = data["shape_name"].upper()
-                if "BOARD" not in name:
-                    continue
-                found = True
-                print(f"\nProcessing PCB: {data['shape_name']}")
-                simplifier.fill_progressive(
-                    data["shape_name"], data["seeds"], data["adjacency"],
-                    data["bboxes"], data["face_types"],
-                    interactive=True, seed_groups=data.get("seed_groups", []),
-                )
-
-            if not found:
-                print("No PCB board component found (name must contain 'BOARD').")
-        finally:
-            try: conn.execute_vba('Sub Main\n  WCS.ActivateWCS "global"\n  Pick.ClearAllPicks\nEnd Sub\n')
-            except: pass
-            conn.close()
+        import importlib
+        import code.run_sunray_v6 as pcb_mod
+        importlib.reload(pcb_mod)
+        pcb_mod.PROJECT = project
+        pcb_mod.main()
 
     def _run_shieldcan(self, project):
         """Run shield can simplifier (cover + frame)."""
