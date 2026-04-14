@@ -72,20 +72,20 @@ code/
     cst_connection.py    - COM connection to CST 2025
     feature_detector.py  - SAT parser + hole detection + board edge filter
     simplifier.py        - Progressive hole filling via AddToHistory
-    wall_detector.py     - Shield can wall + dimple detection
+    wall_detector.py     - Shield can wall + dimple detection (W-touch, aspect ratio, UV overlap)
     models.py            - Data classes
+    shield_can_dialog.py - 3-column classifier dialog for cover/frame/one-piece
+    component_cache.py   - Shared component cache (PCB/FPC names across tool runs)
     run_combined_v1.py   - Combined simplifier (auto-classifies components)
     run_sunray_v6.py     - PCB simplifier (standalone)
-    run_led_v2.py        - Shield can cover simplifier (standalone)
-    run_frame_v1.py      - Shield can frame simplifier (standalone)
+    run_shieldcan.py     - Shield can simplifier (cover + frame, two-pass workflow)
     run_contact_check.py - Contact checker (generic, experimental)
-    debug_contact_v17_shieldcan.py - Shield can cover-frame bridge (recommended)
+    debug_shieldcan_walls.py - Shield can debug script (interactive wall + dimple testing)
+    debug_contact_v17_shieldcan.py - Shield can cover-frame bridge
     debug_pcb_edge_v2.py     - PCB grounding bridge
     debug_connector_v2.py    - Connector replacement with FPC/PCB bridging
     gui_cleanup.py       - Component cleanup GUI (separate tool)
     gui.py               - GUI launcher (5 buttons)
-    component_cache.py   - Shared component cache (PCB/FPC names across tool runs)
-    run_led_v1.py        - Earlier shield can cover version
 ```
 
 
@@ -106,10 +106,41 @@ Validated on Sunray_metal_v4_fun1.
 
 ## Shield Can Cover Simplifier Algorithm
 
-### 1. Wall Detection (Cover)
-- Find top face (largest plane face by bbox area)
-- Walk adjacency: top face → curved corner faces (torus/spline) → perpendicular plane faces
-- These perpendicular planes are the side walls (works for any angle)
+**Note**: This is the best achievable version using rule-based SAT geometry filtering. Some edge cases (corner fillets near wall intersections) may still be incorrectly detected. A computer vision-based approach is planned for future improvement.
+
+### 1. Wall Detection (Cover) — Validated with W-touch + Aspect Ratio
+- Find reference face (largest plane face by bbox area) → W axis = reference normal
+- Walk SAT adjacency: reference face → curved corner fillet faces → perpendicular plane faces
+- **W-touch validation**: each candidate wall's bbox must physically touch its connecting fillet's bbox in the W direction (within 0.1mm tolerance). Rejects dimple faces that share SAT edges with fillets but aren't physically adjacent.
+- **Aspect ratio validation**: in wall-local coords (W=wall normal, U=ref normal, V=W×U), V span must be ≥ U span. Real walls are longer than tall; small structural faces are not.
+
+### 2. Wall Sub-Grouping
+- **Copper thickness measurement**: find two largest parallel plane faces, measure distance → copper thickness
+- **Group by normal**: all walls with same normal direction (dot > 0.99) go together
+- **Recursive W-distance splitting**: within each normal-group, find root face (largest area), split by W distance from root (threshold = 1.5× copper thickness). Recurse if sub-group has >2 faces.
+- **UV overlap splitting**: for sub-groups still >2 faces, split by UV bbox overlap. Walls at different positions along the same side don't overlap in UV → separate sub-groups.
+
+### 3. Dimple Detection (per wall sub-group)
+For each wall in the sub-group, find dimple faces using local UVW coordinate projection:
+- **W axis** = wall normal direction
+- **U axis** = short edge of wall, **V axis** = long edge (swapped based on bbox projection)
+- **Exclude set**: reference face + all wall faces + corner fillet faces
+- For each non-excluded face:
+  - **W proximity**: face center's W distance from wall < 2× face's max UV span
+  - **UV containment**: face UV footprint within wall's UV range (0.1mm margin)
+  - **V span check**: face V span < 50% of wall V span (only check V, skip U — dimples can span full wall width)
+  - **Normal filter**: reject plane/cone faces perpendicular to wall (|dot| < 0.3)
+- **Zero-bbox expansion**: add adjacency neighbors with zero bboxes (spline surfaces), skip faces adjacent to corner fillets
+- Merge dimples from all walls in the sub-group, remove already-consumed faces
+
+### 4. Two-Pass Workflow
+- **Pass 1**: interactive — export SAT, detect walls, detect dimples, ask user confirmation per sub-group
+- **Pass 2**: verification — re-export SAT (fresh geometry after pass 1), re-detect from scratch, ask user confirmation for any remaining dimples
+- If pass 2 finds nothing → verification passed
+
+### 5. Fill
+- Pick all dimple faces via AddToHistory, then RemoveSelectedFaces via AddToHistory
+- All operations persist in CST history list for user revert (Ctrl+Z)
 
 ## Shield Can Frame Simplifier Algorithm
 

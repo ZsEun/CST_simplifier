@@ -285,94 +285,18 @@ class App:
 
     def _run_shieldcan(self, project):
         """Run shield can simplifier (cover + frame)."""
-        from code.feature_detector import FeatureDetector, SATParser
-        from code.wall_detector import WallDetector, WallInfo, _dot, _normalize
-        from code.simplifier import Simplifier
-
-        conn = self._connect(project)
+        import importlib
+        import builtins
+        import code.run_shieldcan as sc_mod
+        importlib.reload(sc_mod)
+        sc_mod.PROJECT = project
+        # Pass root widget so the dialog can be created on the main thread
+        builtins._shield_can_gui_root = self.root
         try:
-            det = FeatureDetector(conn)
-            solid_data = det.detect_seeds()
-            simplifier = Simplifier(conn)
-
-            for data in solid_data:
-                name = data["shape_name"].upper()
-                if "COVER" in name:
-                    mode = "cover"
-                elif "FRAM" in name:
-                    mode = "frame"
-                else:
-                    continue
-
-                shape_name = data["shape_name"]
-                print(f"\nProcessing [{mode.upper()}]: {shape_name}")
-
-                parts = shape_name.split(":")
-                sat = det._export_sat(parts[0], parts[1])
-                parser = SATParser(sat)
-                face_data = parser.parse()
-                adjacency = parser.build_adjacency()
-                bboxes = parser.get_bounding_boxes()
-
-                wd = WallDetector()
-                ref_pid, ref_n = wd.find_top_face(face_data, bboxes)
-
-                if mode == "cover":
-                    walls = wd.discover_side_walls(ref_pid, ref_n, face_data, adjacency, bboxes)
-                else:
-                    walls = []
-                    for pid, info in face_data.items():
-                        if pid == ref_pid: continue
-                        if info["surface_type"] != "plane-surface": continue
-                        geom = info.get("geometry", {})
-                        n = geom.get("normal")
-                        if n is None: continue
-                        n = _normalize(n)
-                        if n == (0.0, 0.0, 0.0): continue
-                        if abs(_dot(n, ref_n)) <= 0.05:
-                            bb = bboxes.get(pid, (0,0,0,0,0,0))
-                            walls.append(WallInfo(face_pid=pid, normal=n, bbox=bb))
-
-                def _wall_area(w):
-                    b = w.bbox
-                    dims = sorted([b[3]-b[0], b[4]-b[1], b[5]-b[2]], reverse=True)
-                    return dims[0] * dims[1]
-                walls.sort(key=_wall_area)
-
-                consumed = set()
-                for wi, wall in enumerate(walls):
-                    dimples = wd.find_dimple_faces(wall, face_data, adjacency, bboxes, ref_pid, walls)
-                    dimples = [d for d in dimples if d not in consumed]
-                    if not dimples: continue
-
-                    wn = wall.normal; bb = wall.bbox
-                    cx=(bb[0]+bb[3])/2; cy=(bb[1]+bb[4])/2; cz=(bb[2]+bb[5])/2
-                    try:
-                        conn.execute_vba(
-                            'Sub Main\n'
-                            f'  WCS.SetOrigin {cx}, {cy}, {cz}\n'
-                            f'  WCS.SetNormal {wn[0]}, {wn[1]}, {wn[2]}\n'
-                            '  WCS.ActivateWCS "local"\nEnd Sub\n')
-                    except: pass
-                    try: simplifier._highlight_faces(shape_name, dimples)
-                    except: pass
-
-                    print(f"  Wall {wi+1}/{len(walls)}: {len(dimples)} dimples")
-                    action = input(f"Remove {len(dimples)} faces? (y/n/q): ").strip().lower()
-                    if action == "q": break
-                    if action != "y":
-                        try: conn.execute_vba('Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
-                        except: pass
-                        continue
-
-                    ok, msg = simplifier._try_fill_hole_silent(shape_name, dimples, wi+1)
-                    if ok: consumed.update(dimples)
-                    print(f"    {'OK' if ok else 'FAILED'}")
-
+            sc_mod.main()
         finally:
-            try: conn.execute_vba('Sub Main\n  WCS.ActivateWCS "global"\n  Pick.ClearAllPicks\nEnd Sub\n')
-            except: pass
-            conn.close()
+            if hasattr(builtins, '_shield_can_gui_root'):
+                del builtins._shield_can_gui_root
 
     def _run_bridge(self, project):
         """Run shield can cover-frame bridge."""

@@ -217,71 +217,37 @@ class Simplifier:
 
     def _try_fill_hole_silent(self, shape_name: str, face_ids: List[int],
                                hole_index: int) -> Tuple[bool, str]:
-        """Try to fill a hole silently — no CST GUI error popups.
+        """Try to fill a hole via AddToHistory (persists in CST history for revert).
 
-        All operations use RunScript with On Error Resume Next to avoid
-        any CST GUI error popups. AddToHistory is only called after
-        confirming success.
+        All operations use AddToHistory so they appear in the CST history list.
+        If RemoveSelectedFaces fails, CST may show an error popup — this is
+        unavoidable if we want history persistence.
         """
-        # Step 1: Pick all faces via RunScript (silent, no popup on invalid face)
-        pick_lines = "\n".join(
-            f'  Pick.PickFaceFromId "{shape_name}", "{fid}"'
-            for fid in face_ids
-        )
-        pick_code = (
-            'Sub Main\n'
-            f'  Open "{self._out_vba}" For Output As #1\n'
-            '  On Error Resume Next\n'
-            '  Pick.ClearAllPicks\n'
-            f'{pick_lines}\n'
-            '  If Err.Number <> 0 Then\n'
-            '    Print #1, "PICK_FAIL"\n'
-            '    Err.Clear\n'
-            '  Else\n'
-            '    Print #1, "PICK_OK"\n'
-            '  End If\n'
-            '  Close #1\n'
-            'End Sub\n'
-        )
-        result = self._run_vba(pick_code)
-        if "PICK_OK" not in (result or ""):
-            try:
-                self._conn.execute_vba('Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
-            except: pass
-            return False, f"Pick failed: {result}"
+        # Step 1: Pick each face via AddToHistory
+        self._add_to_history("clear picks", "Pick.ClearAllPicks")
+        for fid in face_ids:
+            pick_code = f'Pick.PickFaceFromId "{shape_name}", "{fid}"'
+            result = self._add_to_history("pick face", pick_code)
+            if "HIST_ERR" in (result or ""):
+                self._add_to_history("clear picks", "Pick.ClearAllPicks")
+                return False, f"Pick failed for face {fid}: {result}"
 
-        # Step 2: Try RemoveSelectedFaces via RunScript (silent)
-        test_code = (
-            'Sub Main\n'
-            f'  Open "{self._out_vba}" For Output As #1\n'
-            '  On Error Resume Next\n'
-            '  With LocalModification\n'
-            '    .Reset\n'
-            f'    .Name "{shape_name}"\n'
-            '    .RemoveSelectedFaces\n'
-            '  End With\n'
-            '  If Err.Number <> 0 Then\n'
-            '    Print #1, "REMOVE_FAIL"\n'
-            '    Err.Clear\n'
-            '  Else\n'
-            '    Print #1, "OK"\n'
-            '  End If\n'
-            '  Close #1\n'
-            'End Sub\n'
+        # Step 2: RemoveSelectedFaces via AddToHistory (persists in history)
+        remove_code = (
+            'With LocalModification\n'
+            '  .Reset\n'
+            f'  .Name "{shape_name}"\n'
+            '  .RemoveSelectedFaces\n'
+            'End With'
         )
-        result = self._run_vba(test_code)
-
-        if "OK" not in (result or ""):
-            # Remove failed — clear picks
-            try:
-                self._conn.execute_vba('Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
-            except: pass
-            return False, f"Silent remove failed: {result}"
-
-        # Step 3: Success — clear picks
         try:
-            self._conn.execute_vba('Sub Main\n  Pick.ClearAllPicks\nEnd Sub\n')
-        except: pass
+            result = self._add_to_history("remove faces", remove_code)
+            if "HIST_ERR" in (result or ""):
+                self._add_to_history("clear picks", "Pick.ClearAllPicks")
+                return False, f"Remove failed: {result}"
+        except Exception as exc:
+            self._add_to_history("clear picks", "Pick.ClearAllPicks")
+            return False, f"Remove exception: {exc}"
 
         return True, f"pick {face_ids[0]}: OK; remove: OK"
 

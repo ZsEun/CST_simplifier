@@ -159,6 +159,151 @@ class WallDetector:
         return walls
 
 
+    def discover_side_walls_validated(
+        self,
+        top_face_pid: int,
+        top_normal: Tuple[float, float, float],
+        face_data: Dict[int, dict],
+        adjacency: Dict[int, Set[int]],
+        bboxes: Dict[int, Tuple],
+        perpendicular_threshold: float = 0.05,
+        w_touch_tolerance: float = 0.1,
+    ) -> List[WallInfo]:
+        """Find side walls with W-touch and aspect ratio validation.
+
+        Improved algorithm over discover_side_walls:
+        1. Find curved faces adjacent to top face (corner fillets)
+        2. Find plane faces adjacent to fillets, perpendicular to top normal
+        3. W-touch validation: wall bbox must touch fillet bbox in W direction
+           (W = top face normal). Rejects dimple faces that share SAT edges
+           with fillets but aren't physically adjacent in W.
+        4. Aspect ratio validation: in wall-local coords (W=wall normal,
+           U=ref normal, V=W×U), V span must be >= U span. Real walls are
+           longer than tall; small structural faces are not.
+
+        Args:
+            top_face_pid: pid of the top/reference face
+            top_normal: normal of the top face (used as W axis)
+            face_data: pid → {surface_type, geometry}
+            adjacency: pid → set of adjacent pids
+            bboxes: pid → bbox tuple
+            perpendicular_threshold: max |dot| for perpendicular check
+            w_touch_tolerance: tolerance in mm for W-touch check
+
+        Returns:
+            List of WallInfo for validated side walls.
+        """
+        w_axis = top_normal
+
+        def _w_range(bbox):
+            if bbox is None:
+                return None
+            if bbox == (0,0,0,0,0,0) or bbox == (0.0,0.0,0.0,0.0,0.0,0.0):
+                return None
+            corners = [
+                (bbox[0],bbox[1],bbox[2]),(bbox[3],bbox[1],bbox[2]),
+                (bbox[0],bbox[4],bbox[2]),(bbox[3],bbox[4],bbox[2]),
+                (bbox[0],bbox[1],bbox[5]),(bbox[3],bbox[1],bbox[5]),
+                (bbox[0],bbox[4],bbox[5]),(bbox[3],bbox[4],bbox[5]),
+            ]
+            ws = [c[0]*w_axis[0]+c[1]*w_axis[1]+c[2]*w_axis[2] for c in corners]
+            return (min(ws), max(ws))
+
+        def _w_touches(r1, r2):
+            if r1 is None or r2 is None:
+                return False
+            return (r1[1] + w_touch_tolerance >= r2[0] and
+                    r2[1] + w_touch_tolerance >= r1[0])
+
+        # Step 1: curved faces adjacent to top face
+        top_neighbors = adjacency.get(top_face_pid, set())
+        curved_faces = set()
+        for npid in top_neighbors:
+            info = face_data.get(npid)
+            if info and "plane" not in info["surface_type"]:
+                curved_faces.add(npid)
+
+        # Step 2: candidate walls + track connecting fillets
+        candidate_set = set()
+        wall_to_fillets: Dict[int, Set[int]] = {}
+        for cfid in curved_faces:
+            for npid in adjacency.get(cfid, set()):
+                if npid == top_face_pid:
+                    continue
+                info = face_data.get(npid)
+                if info is None or info["surface_type"] != "plane-surface":
+                    continue
+                geom = info.get("geometry", {})
+                normal = geom.get("normal")
+                if normal is None:
+                    continue
+                normal = _normalize(normal)
+                if abs(_dot(normal, top_normal)) > perpendicular_threshold:
+                    continue
+                candidate_set.add(npid)
+                if npid not in wall_to_fillets:
+                    wall_to_fillets[npid] = set()
+                wall_to_fillets[npid].add(cfid)
+
+        logger.info("Step 2: %d candidates before validation", len(candidate_set))
+
+        # Step 3: W-touch validation
+        w_passed = []
+        for pid in sorted(candidate_set):
+            wall_wr = _w_range(bboxes.get(pid))
+            fillets = wall_to_fillets.get(pid, set())
+            touches = False
+            for cfid in fillets:
+                cf_wr = _w_range(bboxes.get(cfid))
+                if _w_touches(wall_wr, cf_wr):
+                    touches = True
+                    break
+            if touches:
+                info = face_data.get(pid)
+                normal = _normalize(info.get("geometry", {}).get("normal", (0,0,0)))
+                bb = bboxes.get(pid, (0,0,0,0,0,0))
+                w_passed.append(WallInfo(face_pid=pid, normal=normal, bbox=bb))
+            else:
+                logger.info("  W-touch rejected: pid=%d", pid)
+
+        # Step 4: Aspect ratio validation (V span >= U span)
+        walls = []
+        for w in w_passed:
+            wn = w.normal
+            u_ax = top_normal
+            # V = W_wall × U
+            vx = wn[1]*u_ax[2] - wn[2]*u_ax[1]
+            vy = wn[2]*u_ax[0] - wn[0]*u_ax[2]
+            vz = wn[0]*u_ax[1] - wn[1]*u_ax[0]
+            vmag = math.sqrt(vx*vx + vy*vy + vz*vz)
+            if vmag < 1e-12:
+                walls.append(w)
+                continue
+            v_ax = (vx/vmag, vy/vmag, vz/vmag)
+
+            bb = w.bbox
+            corners = [
+                (bb[0],bb[1],bb[2]),(bb[3],bb[1],bb[2]),
+                (bb[0],bb[4],bb[2]),(bb[3],bb[4],bb[2]),
+                (bb[0],bb[1],bb[5]),(bb[3],bb[1],bb[5]),
+                (bb[0],bb[4],bb[5]),(bb[3],bb[4],bb[5]),
+            ]
+            us = [c[0]*u_ax[0]+c[1]*u_ax[1]+c[2]*u_ax[2] for c in corners]
+            vs = [c[0]*v_ax[0]+c[1]*v_ax[1]+c[2]*v_ax[2] for c in corners]
+            u_span = max(us) - min(us)
+            v_span = max(vs) - min(vs)
+
+            if v_span >= u_span:
+                walls.append(w)
+            else:
+                logger.info("  Aspect rejected: pid=%d, U=%.3f, V=%.3f",
+                            w.face_pid, u_span, v_span)
+
+        logger.info("Validated %d side walls (from %d candidates)",
+                     len(walls), len(candidate_set))
+        return walls, curved_faces
+
+
     def find_dimple_faces(
         self,
         wall: WallInfo,
@@ -170,6 +315,7 @@ class WallDetector:
         max_span_ratio: float = 0.5,
         normal_threshold: float = 0.3,
         margin: float = 0.1,
+        corner_fillets: Set[int] = None,
     ) -> List[int]:
         """Find dimple/hole faces on a side wall using local UV projection.
 
@@ -192,6 +338,8 @@ class WallDetector:
             max_span_ratio: max UV span ratio relative to wall (default 0.5)
             normal_threshold: min |dot| to keep plane/cone faces (default 0.3)
             margin: UV containment margin (default 0.1)
+            corner_fillets: set of corner fillet face pids (used to filter
+                zero-bbox expansion — skip faces adjacent to fillets)
 
         Returns:
             List of face pids that are dimple/hole faces on this wall.
@@ -199,19 +347,42 @@ class WallDetector:
         wn = wall.normal
         wb = wall.bbox
 
-        # Build local UVW axes (W = wall normal)
+        # Build local UVW axes (W = wall normal, U = short edge, V = long edge)
         nx, ny, nz = wn
         ref = (1, 0, 0) if abs(nx) < 0.9 else (0, 1, 0)
         ux = ny * ref[2] - nz * ref[1]
         uy = nz * ref[0] - nx * ref[2]
         uz = nx * ref[1] - ny * ref[0]
         mag = math.sqrt(ux*ux + uy*uy + uz*uz)
-        u_axis = (ux/mag, uy/mag, uz/mag)
-        v_axis = (ny*u_axis[2] - nz*u_axis[1],
-                  nz*u_axis[0] - nx*u_axis[2],
-                  nx*u_axis[1] - ny*u_axis[0])
+        tmp_u = (ux/mag, uy/mag, uz/mag)
+        tmp_v = (ny*tmp_u[2] - nz*tmp_u[1],
+                  nz*tmp_u[0] - nx*tmp_u[2],
+                  nx*tmp_u[1] - ny*tmp_u[0])
 
-        # Project wall bbox into UV
+        # Project wall bbox into temp UV to find which is short/long
+        def _project_uv(bb):
+            corners = [
+                (bb[0], bb[1], bb[2]), (bb[3], bb[1], bb[2]),
+                (bb[0], bb[4], bb[2]), (bb[3], bb[4], bb[2]),
+                (bb[0], bb[1], bb[5]), (bb[3], bb[1], bb[5]),
+                (bb[0], bb[4], bb[5]), (bb[3], bb[4], bb[5]),
+            ]
+            us = [c[0]*tmp_u[0]+c[1]*tmp_u[1]+c[2]*tmp_u[2] for c in corners]
+            vs = [c[0]*tmp_v[0]+c[1]*tmp_v[1]+c[2]*tmp_v[2] for c in corners]
+            return min(us), max(us), min(vs), max(vs)
+
+        tmp_u_min, tmp_u_max, tmp_v_min, tmp_v_max = _project_uv(wb)
+        tmp_u_span = tmp_u_max - tmp_u_min
+        tmp_v_span = tmp_v_max - tmp_v_min
+
+        # Swap so U = short edge, V = long edge
+        if tmp_u_span > tmp_v_span:
+            tmp_u, tmp_v = tmp_v, tmp_u
+
+        u_axis = tmp_u
+        v_axis = tmp_v
+
+        # Redefine _project_uv with final axes
         def _project_uv(bb):
             corners = [
                 (bb[0], bb[1], bb[2]), (bb[3], bb[1], bb[2]),
@@ -232,9 +403,10 @@ class WallDetector:
         wall_center = ((wb[0]+wb[3])/2, (wb[1]+wb[4])/2, (wb[2]+wb[5])/2)
         wall_w = wall_center[0]*wn[0] + wall_center[1]*wn[1] + wall_center[2]*wn[2]
 
-        # Exclude: top face, all walls, wall's direct neighbors
+        # Exclude: top face, all walls, and corner fillets
         exclude = {top_face_pid} | {w.face_pid for w in all_walls}
-        exclude.update(adjacency.get(wall.face_pid, set()))
+        if corner_fillets:
+            exclude |= corner_fillets
 
         result = []
         for pid, info in face_data.items():
@@ -259,11 +431,9 @@ class WallDetector:
                     fv_min >= wv_min - margin and fv_max <= wv_max + margin):
                 continue
 
-            # Check UV span is small
+            # Check UV span: only check V (long edge) — dimples can span full wall width
             fu_span = fu_max - fu_min
             fv_span = fv_max - fv_min
-            if wall_u_span > 0 and fu_span > wall_u_span * max_span_ratio:
-                continue
             if wall_v_span > 0 and fv_span > wall_v_span * max_span_ratio:
                 continue
 
@@ -284,6 +454,8 @@ class WallDetector:
         # Expand: add adjacency neighbors with zero bboxes (spline surfaces
         # whose bbox couldn't be extracted). These are curved transition
         # surfaces of dimples that are adjacent to already-found dimple faces.
+        # Skip faces adjacent to corner fillets — those are structural surfaces.
+        fillet_set = corner_fillets or set()
         result_set = set(result)
         expanded = set()
         for pid in result:
@@ -292,6 +464,9 @@ class WallDetector:
                     continue
                 nbb = bboxes.get(neighbor, (0,0,0,0,0,0))
                 if nbb == (0, 0, 0, 0, 0, 0) or nbb == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0):
+                    # Skip if adjacent to any corner fillet
+                    if fillet_set and (adjacency.get(neighbor, set()) & fillet_set):
+                        continue
                     expanded.add(neighbor)
         result_set.update(expanded)
 
@@ -427,3 +602,456 @@ class WallDetector:
                 })
 
         return groups
+
+    def find_dimples_merged_group(
+        self,
+        walls_group: List[WallInfo],
+        face_data: Dict[int, dict],
+        adjacency: Dict[int, Set[int]],
+        bboxes: Dict[int, Tuple],
+        top_face_pid: int,
+        all_walls: List[WallInfo],
+        max_span_ratio: float = 0.5,
+        normal_threshold: float = 0.3,
+        margin: float = 0.1,
+    ) -> List[int]:
+        """Find dimple faces for a group of same-normal walls using merged bbox.
+
+        Key differences from find_dimple_faces:
+        - Uses union bbox of all walls in the group
+        - Exclude set: only {ref face, all wall faces} — NOT wall neighbors
+        - This allows dimple faces adjacent to the wall to be found
+        """
+        wn = walls_group[0].normal
+
+        # Merge bboxes
+        merged_bb = None
+        for wall in walls_group:
+            wb = wall.bbox
+            if merged_bb is None:
+                merged_bb = list(wb)
+            else:
+                for i in range(3):
+                    merged_bb[i] = min(merged_bb[i], wb[i])
+                for i in range(3, 6):
+                    merged_bb[i] = max(merged_bb[i], wb[i])
+        merged_bb = tuple(merged_bb)
+
+        # Build UVW (U=short edge, V=long edge)
+        nx, ny, nz = wn
+        ref = (1, 0, 0) if abs(nx) < 0.9 else (0, 1, 0)
+        ux = ny * ref[2] - nz * ref[1]
+        uy = nz * ref[0] - nx * ref[2]
+        uz = nx * ref[1] - ny * ref[0]
+        mag = math.sqrt(ux*ux + uy*uy + uz*uz)
+        tmp_u = (ux/mag, uy/mag, uz/mag)
+        tmp_v = (ny*tmp_u[2] - nz*tmp_u[1],
+                 nz*tmp_u[0] - nx*tmp_u[2],
+                 nx*tmp_u[1] - ny*tmp_u[0])
+
+        def _project(bb, u_ax, v_ax):
+            corners = [
+                (bb[0],bb[1],bb[2]),(bb[3],bb[1],bb[2]),
+                (bb[0],bb[4],bb[2]),(bb[3],bb[4],bb[2]),
+                (bb[0],bb[1],bb[5]),(bb[3],bb[1],bb[5]),
+                (bb[0],bb[4],bb[5]),(bb[3],bb[4],bb[5]),
+            ]
+            us = [c[0]*u_ax[0]+c[1]*u_ax[1]+c[2]*u_ax[2] for c in corners]
+            vs = [c[0]*v_ax[0]+c[1]*v_ax[1]+c[2]*v_ax[2] for c in corners]
+            return min(us), max(us), min(vs), max(vs)
+
+        tu_min, tu_max, tv_min, tv_max = _project(merged_bb, tmp_u, tmp_v)
+        if (tu_max - tu_min) > (tv_max - tv_min):
+            tmp_u, tmp_v = tmp_v, tmp_u
+        u_axis, v_axis = tmp_u, tmp_v
+
+        def _project_uv(bb):
+            return _project(bb, u_axis, v_axis)
+
+        wu_min, wu_max, wv_min, wv_max = _project_uv(merged_bb)
+        wall_v_span = wv_max - wv_min
+
+        wall_center = ((merged_bb[0]+merged_bb[3])/2, (merged_bb[1]+merged_bb[4])/2,
+                        (merged_bb[2]+merged_bb[5])/2)
+        wall_w = wall_center[0]*wn[0] + wall_center[1]*wn[1] + wall_center[2]*wn[2]
+
+        # Exclude: only ref face + all wall faces (NOT wall neighbors)
+        exclude = {top_face_pid} | {w.face_pid for w in all_walls}
+
+        result = []
+        for pid, info in face_data.items():
+            if pid in exclude:
+                continue
+            bb = bboxes.get(pid)
+            if bb is None:
+                continue
+            fu_min, fu_max, fv_min, fv_max = _project_uv(bb)
+            face_center = ((bb[0]+bb[3])/2, (bb[1]+bb[4])/2, (bb[2]+bb[5])/2)
+            face_w = face_center[0]*wn[0] + face_center[1]*wn[1] + face_center[2]*wn[2]
+            face_max_uv_span = max(fu_max - fu_min, fv_max - fv_min)
+            if abs(face_w - wall_w) > 2 * face_max_uv_span:
+                continue
+            if not (fu_min >= wu_min - margin and fu_max <= wu_max + margin and
+                    fv_min >= wv_min - margin and fv_max <= wv_max + margin):
+                continue
+            fv_span = fv_max - fv_min
+            if wall_v_span > 0 and fv_span > wall_v_span * max_span_ratio:
+                continue
+            stype = info.get("surface_type", "")
+            geom = info.get("geometry", {})
+            if stype == "plane-surface":
+                fn = geom.get("normal")
+                if fn and abs(_dot(fn, wn)) < normal_threshold:
+                    continue
+            elif stype == "cone-surface":
+                axis = geom.get("axis")
+                if axis and abs(_dot(axis, wn)) < normal_threshold:
+                    continue
+            result.append(pid)
+
+        # Zero-bbox expansion
+        result_set = set(result)
+        expanded = set()
+        for pid in result:
+            for neighbor in adjacency.get(pid, set()):
+                if neighbor in result_set or neighbor in exclude or neighbor in expanded:
+                    continue
+                nbb = bboxes.get(neighbor, (0,0,0,0,0,0))
+                if nbb == (0,0,0,0,0,0) or nbb == (0.0,0.0,0.0,0.0,0.0,0.0):
+                    expanded.add(neighbor)
+        result_set.update(expanded)
+
+        logger.info("Merged walls %s: found %d dimple faces (+%d zero-bbox): %s",
+                     [w.face_pid for w in walls_group], len(result), len(expanded),
+                     sorted(result_set))
+        return sorted(result_set)
+
+
+def group_walls_by_normal(walls: List[WallInfo], threshold: float = 0.99) -> List[List[WallInfo]]:
+    """Group walls with similar normals (dot > threshold).
+
+    Returns list of groups. Each group is a list of WallInfo with similar normals.
+    Single walls (no similar partner) are returned as groups of 1.
+    """
+    assigned = set()
+    groups = []
+    for i, w1 in enumerate(walls):
+        if w1.face_pid in assigned:
+            continue
+        group = [w1]
+        assigned.add(w1.face_pid)
+        for j, w2 in enumerate(walls):
+            if j <= i or w2.face_pid in assigned:
+                continue
+            if abs(_dot(w1.normal, w2.normal)) > threshold:
+                group.append(w2)
+                assigned.add(w2.face_pid)
+        groups.append(group)
+    return groups
+
+
+def assign_dimples_to_nearest_wall(
+    walls: List[WallInfo],
+    wall_dimples: Dict[int, List[int]],
+    bboxes: Dict[int, Tuple],
+) -> Dict[int, List[int]]:
+    """Reassign dimple faces to the nearest wall by W distance.
+
+    When multiple walls have the same normal (e.g., two halves of the same
+    side), dimples from one wall may pass the spatial filters for the other.
+    This function checks each dimple's W distance to all walls with the same
+    normal and assigns it to the closest one.
+
+    Args:
+        walls: list of WallInfo objects
+        wall_dimples: dict mapping wall.face_pid → list of dimple face IDs
+        bboxes: per-face bounding boxes
+
+    Returns:
+        Updated wall_dimples dict with reassigned faces.
+    """
+    # Build wall W positions
+    wall_w_positions = {}
+    for wall in walls:
+        wb = wall.bbox
+        wn = wall.normal
+        wc = ((wb[0]+wb[3])/2, (wb[1]+wb[4])/2, (wb[2]+wb[5])/2)
+        wall_w_positions[wall.face_pid] = wc[0]*wn[0] + wc[1]*wn[1] + wc[2]*wn[2]
+
+    # Group walls by similar normal (dot > 0.99)
+    wall_groups = []
+    assigned_walls = set()
+    for i, w1 in enumerate(walls):
+        if w1.face_pid in assigned_walls:
+            continue
+        group = [w1]
+        assigned_walls.add(w1.face_pid)
+        for j, w2 in enumerate(walls):
+            if j <= i or w2.face_pid in assigned_walls:
+                continue
+            if abs(_dot(w1.normal, w2.normal)) > 0.99:
+                group.append(w2)
+                assigned_walls.add(w2.face_pid)
+        if len(group) > 1:
+            wall_groups.append(group)
+
+    # For each group of same-normal walls, reassign dimples
+    result = dict(wall_dimples)
+    for group in wall_groups:
+        group_pids = [w.face_pid for w in group]
+        # Collect all dimples from all walls in this group
+        all_dimples = set()
+        for pid in group_pids:
+            all_dimples.update(result.get(pid, []))
+
+        if not all_dimples:
+            continue
+
+        # Reassign each dimple to the nearest wall
+        new_assignment = {pid: [] for pid in group_pids}
+        for fid in all_dimples:
+            bb = bboxes.get(fid)
+            if bb is None:
+                # Can't compute W distance — assign to first wall that had it
+                for pid in group_pids:
+                    if fid in result.get(pid, []):
+                        new_assignment[pid].append(fid)
+                        break
+                continue
+
+            # Compute face W position using the group's shared normal
+            wn = group[0].normal
+            fc = ((bb[0]+bb[3])/2, (bb[1]+bb[4])/2, (bb[2]+bb[5])/2)
+            face_w = fc[0]*wn[0] + fc[1]*wn[1] + fc[2]*wn[2]
+
+            # Find nearest wall
+            best_pid = group_pids[0]
+            best_dist = float('inf')
+            for pid in group_pids:
+                dist = abs(face_w - wall_w_positions[pid])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pid = pid
+            new_assignment[best_pid].append(fid)
+
+        for pid in group_pids:
+            result[pid] = sorted(new_assignment[pid])
+
+    return result
+
+
+def find_dimples_for_wall_group(
+    walls_group: List[WallInfo],
+    face_data,
+    adjacency,
+    bboxes,
+    ref_pid: int,
+    all_walls: List[WallInfo],
+    max_span_ratio: float = 0.5,
+    normal_threshold: float = 0.3,
+    margin: float = 0.1,
+) -> List[int]:
+    """Find dimple faces for a group of same-normal walls using merged bbox.
+
+    Key differences from find_dimple_faces:
+    - Uses union bbox of all walls in the group
+    - Exclude set: only {ref face, all wall faces} — NOT wall neighbors
+    - U = short edge, V = long edge; only V span is checked
+    """
+    wn = walls_group[0].normal
+
+    # Merge bboxes
+    merged_bb = None
+    for wall in walls_group:
+        wb = wall.bbox
+        if merged_bb is None:
+            merged_bb = list(wb)
+        else:
+            for i in range(3):
+                merged_bb[i] = min(merged_bb[i], wb[i])
+            for i in range(3, 6):
+                merged_bb[i] = max(merged_bb[i], wb[i])
+    merged_bb = tuple(merged_bb)
+
+    nx, ny, nz = wn
+    ref = (1, 0, 0) if abs(nx) < 0.9 else (0, 1, 0)
+    ux = ny * ref[2] - nz * ref[1]
+    uy = nz * ref[0] - nx * ref[2]
+    uz = nx * ref[1] - ny * ref[0]
+    mag = math.sqrt(ux*ux + uy*uy + uz*uz)
+    tmp_u = (ux/mag, uy/mag, uz/mag)
+    tmp_v = (ny*tmp_u[2] - nz*tmp_u[1],
+             nz*tmp_u[0] - nx*tmp_u[2],
+             nx*tmp_u[1] - ny*tmp_u[0])
+
+    def _project(bb, u_ax, v_ax):
+        corners = [
+            (bb[0],bb[1],bb[2]),(bb[3],bb[1],bb[2]),
+            (bb[0],bb[4],bb[2]),(bb[3],bb[4],bb[2]),
+            (bb[0],bb[1],bb[5]),(bb[3],bb[1],bb[5]),
+            (bb[0],bb[4],bb[5]),(bb[3],bb[4],bb[5]),
+        ]
+        us = [c[0]*u_ax[0]+c[1]*u_ax[1]+c[2]*u_ax[2] for c in corners]
+        vs = [c[0]*v_ax[0]+c[1]*v_ax[1]+c[2]*v_ax[2] for c in corners]
+        return min(us), max(us), min(vs), max(vs)
+
+    tu_min, tu_max, tv_min, tv_max = _project(merged_bb, tmp_u, tmp_v)
+    if (tu_max - tu_min) > (tv_max - tv_min):
+        tmp_u, tmp_v = tmp_v, tmp_u
+    u_axis, v_axis = tmp_u, tmp_v
+
+    def _project_uv(bb):
+        return _project(bb, u_axis, v_axis)
+
+    wu_min, wu_max, wv_min, wv_max = _project_uv(merged_bb)
+    wall_v_span = wv_max - wv_min
+
+    wall_center = ((merged_bb[0]+merged_bb[3])/2, (merged_bb[1]+merged_bb[4])/2, (merged_bb[2]+merged_bb[5])/2)
+    wall_w = wall_center[0]*wn[0] + wall_center[1]*wn[1] + wall_center[2]*wn[2]
+
+    exclude = {ref_pid} | {w.face_pid for w in all_walls}
+
+    result = []
+    for pid, info in face_data.items():
+        if pid in exclude:
+            continue
+        bb = bboxes.get(pid)
+        if bb is None:
+            continue
+        fu_min, fu_max, fv_min, fv_max = _project_uv(bb)
+        face_center = ((bb[0]+bb[3])/2, (bb[1]+bb[4])/2, (bb[2]+bb[5])/2)
+        face_w = face_center[0]*wn[0] + face_center[1]*wn[1] + face_center[2]*wn[2]
+        face_max_uv_span = max(fu_max - fu_min, fv_max - fv_min)
+        if abs(face_w - wall_w) > 2 * face_max_uv_span:
+            continue
+        if not (fu_min >= wu_min - margin and fu_max <= wu_max + margin and
+                fv_min >= wv_min - margin and fv_max <= wv_max + margin):
+            continue
+        fv_span = fv_max - fv_min
+        if wall_v_span > 0 and fv_span > wall_v_span * max_span_ratio:
+            continue
+        stype = info.get("surface_type", "")
+        geom = info.get("geometry", {})
+        if stype == "plane-surface":
+            fn = geom.get("normal")
+            if fn and abs(_dot(fn, wn)) < normal_threshold:
+                continue
+        elif stype == "cone-surface":
+            axis = geom.get("axis")
+            if axis and abs(_dot(axis, wn)) < normal_threshold:
+                continue
+        result.append(pid)
+
+    # Zero-bbox expansion
+    result_set = set(result)
+    expanded = set()
+    for pid in result:
+        for neighbor in adjacency.get(pid, set()):
+            if neighbor in result_set or neighbor in exclude or neighbor in expanded:
+                continue
+            nbb = bboxes.get(neighbor, (0,0,0,0,0,0))
+            if nbb == (0,0,0,0,0,0) or nbb == (0.0,0.0,0.0,0.0,0.0,0.0):
+                expanded.add(neighbor)
+    result_set.update(expanded)
+
+    return sorted(result_set)
+
+
+def group_walls_by_normal(walls: List[WallInfo], threshold: float = 0.99) -> List[List[WallInfo]]:
+    """Group walls with the same normal direction.
+
+    All walls with dot > threshold go into the same group.
+    No size or area filtering — just normal direction.
+    """
+    groups = []
+    assigned = set()
+    for i, w1 in enumerate(walls):
+        if w1.face_pid in assigned:
+            continue
+        group = [w1]
+        assigned.add(w1.face_pid)
+        for j, w2 in enumerate(walls):
+            if j <= i or w2.face_pid in assigned:
+                continue
+            if abs(_dot(w1.normal, w2.normal)) > threshold:
+                group.append(w2)
+                assigned.add(w2.face_pid)
+        groups.append(group)
+    return groups
+
+
+def split_subgroups_by_uv_overlap(
+    sub_groups: List[List[WallInfo]],
+    ref_normal: Tuple[float, float, float],
+    margin: float = 0.5,
+) -> List[List[WallInfo]]:
+    """Split sub-groups with >2 walls by UV bbox overlap.
+
+    For sub-groups where walls have the same normal and similar W position
+    but are at different locations along the side, their UV ranges won't
+    overlap. This splits them into separate sub-groups.
+
+    Local coords per wall group: W = wall normal, U = ref normal, V = W × U.
+
+    Args:
+        sub_groups: list of wall sub-groups from W-distance splitting
+        ref_normal: reference face normal (used as U axis)
+        margin: UV overlap margin in mm
+
+    Returns:
+        List of sub-groups, each with walls whose UV ranges overlap.
+    """
+    def _wall_area(w):
+        b = w.bbox
+        dims = sorted([b[3]-b[0], b[4]-b[1], b[5]-b[2]], reverse=True)
+        return dims[0] * dims[1]
+
+    result = []
+    for sg in sub_groups:
+        if len(sg) <= 2:
+            result.append(sg)
+            continue
+
+        wn = sg[0].normal
+        u_ax = ref_normal
+        vx = wn[1]*u_ax[2] - wn[2]*u_ax[1]
+        vy = wn[2]*u_ax[0] - wn[0]*u_ax[2]
+        vz = wn[0]*u_ax[1] - wn[1]*u_ax[0]
+        vmag = math.sqrt(vx*vx + vy*vy + vz*vz)
+        if vmag < 1e-12:
+            result.append(sg)
+            continue
+        v_ax = (vx/vmag, vy/vmag, vz/vmag)
+
+        def _uv_range(w):
+            bb = w.bbox
+            corners = [
+                (bb[0],bb[1],bb[2]),(bb[3],bb[1],bb[2]),
+                (bb[0],bb[4],bb[2]),(bb[3],bb[4],bb[2]),
+                (bb[0],bb[1],bb[5]),(bb[3],bb[1],bb[5]),
+                (bb[0],bb[4],bb[5]),(bb[3],bb[4],bb[5]),
+            ]
+            us = [c[0]*u_ax[0]+c[1]*u_ax[1]+c[2]*u_ax[2] for c in corners]
+            vs = [c[0]*v_ax[0]+c[1]*v_ax[1]+c[2]*v_ax[2] for c in corners]
+            return (min(us), max(us), min(vs), max(vs))
+
+        def _overlaps(r1, r2):
+            return not (r1[1]+margin < r2[0] or r2[1]+margin < r1[0] or
+                        r1[3]+margin < r2[2] or r2[3]+margin < r1[2])
+
+        uv_ranges = {w.face_pid: _uv_range(w) for w in sg}
+        clustered = set()
+        for w in sorted(sg, key=_wall_area, reverse=True):
+            if w.face_pid in clustered:
+                continue
+            cluster = [w]
+            clustered.add(w.face_pid)
+            for w2 in sg:
+                if w2.face_pid in clustered:
+                    continue
+                if any(_overlaps(uv_ranges[cw.face_pid], uv_ranges[w2.face_pid]) for cw in cluster):
+                    cluster.append(w2)
+                    clustered.add(w2.face_pid)
+            result.append(cluster)
+
+    return result
