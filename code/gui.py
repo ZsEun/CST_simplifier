@@ -171,6 +171,12 @@ class App:
         )
         self.btn5.pack(side="left", padx=3)
 
+        self.btn6 = tk.Button(
+            btn_frame2, text="6. Aggressive Shield Can",
+            command=lambda: self._run_tool("aggressive"), width=30, height=1,
+        )
+        self.btn6.pack(side="left", padx=3)
+
         # Log area
         log_frame = tk.Frame(root, padx=10, pady=5)
         log_frame.pack(fill="both", expand=True)
@@ -223,6 +229,7 @@ class App:
         self.btn3.config(state=state)
         self.btn4.config(state=state)
         self.btn5.config(state=state)
+        self.btn6.config(state=state)
 
     def _run_tool(self, tool):
         project = self.project_path.get().strip()
@@ -258,6 +265,8 @@ class App:
                 self._run_pcb_bridge(project)
             elif tool == "connector":
                 self._run_connector(project)
+            elif tool == "aggressive":
+                self._run_aggressive(project)
             self.root.after(0, lambda: self.status.set("Done. Ready for next tool."))
         except UserQuitException:
             print("\nUser quit.")
@@ -339,6 +348,15 @@ class App:
         importlib.reload(conn_mod)
         conn_mod.PROJECT = project
         conn_mod.main()
+
+    def _run_aggressive(self, project):
+        """Run aggressive shield can simplification."""
+        import importlib
+        import builtins
+        import code.debug_aggressive_shieldcan as agg_mod
+        importlib.reload(agg_mod)
+        agg_mod.PROJECT = project
+        agg_mod.main()
 
 
 def main():

@@ -32,12 +32,13 @@ pip install -r code/requirements.txt
 python -m code.gui
 ```
 
-Simple GUI with three buttons:
+Simple GUI with six buttons:
 1. Fill Holes on PCB Board
-2. Simplify Shield Can (Cover + Frame dimples)
+2. Simplify Shield Can (Cover + Frame dimples — standard mode)
 3. Bridge Shield Can Cover-Frame Gap
 4. Bridge Grounding for PCB
 5. Replace Connector
+6. Aggressive Shield Can (delete cover, fill frame top holes)
 
 Browse to your .cst file, click a button. Prompts appear as Yes/No/Quit dialogs (Quit stops the entire tool immediately). Output log shown in the GUI. Each run saves a timestamped log file next to the .cst project.
 
@@ -80,6 +81,7 @@ code/
     run_shieldcan.py     - Shield can simplifier (cover + frame, two-pass workflow)
     run_contact_check.py - Contact checker (generic, experimental)
     debug_shieldcan_walls.py - Shield can debug script (interactive wall + dimple testing)
+    debug_aggressive_shieldcan.py - Aggressive shield can simplification (delete cover, fill frame top)
     debug_contact_v17_shieldcan.py - Shield can cover-frame bridge
     debug_pcb_edge_v2.py     - PCB grounding bridge
     debug_connector_v2.py    - Connector replacement with FPC/PCB bridging
@@ -194,6 +196,23 @@ Both cover and frame simplification use a two-pass workflow:
 - **Pass 1**: Export SAT → detect walls → detect dimples → ask user confirmation → fill
 - **Pass 2**: Re-export SAT (fresh geometry after pass 1) → re-detect from scratch → ask user confirmation for remaining dimples
 - If pass 2 finds nothing → "Verification passed"
+
+## Aggressive Shield Can Simplification Algorithm
+
+For two-piece shield cans, an alternative "aggressive" mode that deletes the cover entirely and fills holes in the frame top face. Produces a simpler model faster.
+
+### Algorithm (per cover-frame pair)
+1. **Simplify frame side walls**: same as standard frame mode (W-height filtered walls, dimple detection, two-pass fill)
+2. **Identify cover reference plane**: export cover SAT, find largest plane face → normal and bbox
+3. **Find frame top face**: re-export frame SAT, find plane face parallel to cover reference (|dot| > 0.95), similar UV bbox (>50% overlap), closest W distance to cover reference
+4. **Find partner face**: parallel to frame top face, >80% UV overlap, W distance < 0.3× frame thickness
+5. **Fill holes between top and partner**:
+   - Hole faces = faces between top and partner in W, within their UV footprint
+   - Plane faces must be perpendicular to top normal (|dot| < 0.3) — hole walls only
+   - Zero-bbox expansion for spline faces
+   - Single fill operation
+6. **Delete cover component**: `Solid.Delete` via AddToHistory (user confirmation required)
+7. **Repeat** for all cover-frame pairs
 
 ## Component Cleanup Tool
 
