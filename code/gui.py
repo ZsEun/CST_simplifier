@@ -204,6 +204,19 @@ class App:
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
 
+    def _save_log(self, log_path):
+        """Save the current log text to a file."""
+        try:
+            self.log_text.config(state="normal")
+            content = self.log_text.get("1.0", "end").strip()
+            self.log_text.config(state="disabled")
+            if content:
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print(f"\nLog saved: {log_path}")
+        except Exception as exc:
+            print(f"\nFailed to save log: {exc}")
+
     def _set_buttons_state(self, state):
         self.btn1.config(state=state)
         self.btn2.config(state=state)
@@ -264,6 +277,15 @@ class App:
             print(traceback.format_exc())
             self.root.after(0, lambda: self.status.set(f"Error: {exc}"))
         finally:
+            # Save log file next to the CST project
+            try:
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                log_dir = os.path.dirname(project)
+                log_path = os.path.join(log_dir, f"cst_simplifier_{tool}_{timestamp}.log")
+                self.root.after(0, self._save_log, log_path)
+            except Exception:
+                pass
             sys.stdout = old_stdout
             builtins.input = old_input
             self.root.after(0, lambda: self._set_buttons_state("normal"))

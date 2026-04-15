@@ -449,6 +449,17 @@ class WallDetector:
                 if axis and abs(_dot(axis, wn)) < normal_threshold:
                     continue
 
+            # U-midpoint filter: dimple faces sit in the middle of the wall
+            # along U (short edge = copper thickness direction).
+            # Corner fillets are at the edges (top/bottom of wall in U).
+            # Reject faces whose U center is in the outer 10% margins.
+            if wall_u_span > 0:
+                face_u_center = (fu_min + fu_max) / 2
+                wall_u_mid = (wu_min + wu_max) / 2
+                u_offset = abs(face_u_center - wall_u_mid)
+                if u_offset > wall_u_span * 0.4:
+                    continue
+
             result.append(pid)
 
         # Expand: add adjacency neighbors with zero bboxes (spline surfaces

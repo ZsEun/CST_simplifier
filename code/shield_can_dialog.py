@@ -52,6 +52,124 @@ def classify_shield_components(all_solids):
     return result
 
 
+def pair_cover_frame_by_bbox(classified, det):
+    """Pair covers and frames by bbox overlap in UV plane.
+
+    For each cover, export SAT to get its bbox. Find a frame with similar
+    UV footprint (>50% overlap in both U and V). Unpaired components
+    move to one_piece.
+
+    Args:
+        classified: dict from classify_shield_components
+        det: FeatureDetector instance (for SAT export)
+
+    Returns:
+        Updated classified dict with paired covers/frames and unpaired → one_piece
+    """
+    from code.feature_detector import SATParser
+
+    def _get_component_bbox(entry):
+        """Export SAT and compute overall bbox for a component."""
+        try:
+            sat = det._export_sat(entry["comp"], entry["solid"])
+            if not sat:
+                return None
+            parser = SATParser(sat)
+            face_data = parser.parse()
+            bboxes = parser.get_bounding_boxes()
+            overall = None
+            for pid, bb in bboxes.items():
+                if bb == (0,0,0,0,0,0) or bb == (0.0,0.0,0.0,0.0,0.0,0.0):
+                    continue
+                if overall is None:
+                    overall = list(bb)
+                else:
+                    for i in range(3):
+                        overall[i] = min(overall[i], bb[i])
+                    for i in range(3, 6):
+                        overall[i] = max(overall[i], bb[i])
+            return tuple(overall) if overall else None
+        except Exception:
+            return None
+
+    def _uv_overlap_ratio(bb1, bb2):
+        """Compute UV overlap ratio and W proximity. W = thinnest axis."""
+        dims1 = [(bb1[i+3]-bb1[i], i) for i in range(3)]
+        dims1.sort(key=lambda x: x[0])
+        w_idx = dims1[0][1]
+        uv_indices = [d[1] for d in dims1[1:]]
+        ratios = []
+        for ax in uv_indices:
+            lo1, hi1 = bb1[ax], bb1[ax+3]
+            lo2, hi2 = bb2[ax], bb2[ax+3]
+            overlap = max(0, min(hi1, hi2) - max(lo1, lo2))
+            min_span = min(hi1-lo1, hi2-lo2)
+            ratios.append(overlap / min_span if min_span > 0 else 0)
+        # W proximity: check if W ranges touch or overlap
+        w_lo1, w_hi1 = bb1[w_idx], bb1[w_idx+3]
+        w_lo2, w_hi2 = bb2[w_idx], bb2[w_idx+3]
+        w_gap = max(0, max(w_lo1, w_lo2) - min(w_hi1, w_hi2))
+        w_span = max(w_hi1-w_lo1, w_hi2-w_lo2)
+        w_close = w_gap <= w_span * 2 if w_span > 0 else w_gap < 1.0
+        return tuple(ratios), w_close, w_gap
+
+    print("  Computing bboxes for cover/frame pairing...")
+    cover_bboxes = {}
+    for entry in classified.get("cover", []):
+        bb = _get_component_bbox(entry)
+        if bb:
+            cover_bboxes[entry["shape"]] = bb
+    frame_bboxes = {}
+    for entry in classified.get("frame", []):
+        bb = _get_component_bbox(entry)
+        if bb:
+            frame_bboxes[entry["shape"]] = bb
+
+    paired_covers = set()
+    paired_frames = set()
+    for cover_entry in classified.get("cover", []):
+        cover_bb = cover_bboxes.get(cover_entry["shape"])
+        if cover_bb is None:
+            continue
+        best_frame = None
+        best_score = 0
+        for frame_entry in classified.get("frame", []):
+            if frame_entry["shape"] in paired_frames:
+                continue
+            frame_bb = frame_bboxes.get(frame_entry["shape"])
+            if frame_bb is None:
+                continue
+            (u_ratio, v_ratio), w_close, w_gap = _uv_overlap_ratio(cover_bb, frame_bb)
+            if not w_close:
+                continue  # too far apart in W — not a pair
+            score = min(u_ratio, v_ratio)
+            if score > best_score and score > 0.5:
+                best_score = score
+                best_frame = frame_entry
+        if best_frame:
+            paired_covers.add(cover_entry["shape"])
+            paired_frames.add(best_frame["shape"])
+            print(f"    Paired: {cover_entry['solid']} <-> {best_frame['solid']} ({best_score:.0%})")
+
+    result = {"cover": [], "frame": [], "one_piece": list(classified.get("one_piece", []))}
+    for entry in classified.get("cover", []):
+        if entry["shape"] in paired_covers:
+            result["cover"].append(entry)
+        else:
+            result["one_piece"].append(entry)
+            print(f"    Unpaired cover → one_piece: {entry['solid']}")
+    for entry in classified.get("frame", []):
+        if entry["shape"] in paired_frames:
+            result["frame"].append(entry)
+        else:
+            result["one_piece"].append(entry)
+            print(f"    Unpaired frame → one_piece: {entry['solid']}")
+
+    print(f"  Pairing: {len(result['cover'])} covers, {len(result['frame'])} frames, "
+          f"{len(result['one_piece'])} one-piece")
+    return result
+
+
 def show_classifier_dialog(root, classified, cst_select_fn=None):
     """Show the classifier dialog and return confirmed lists.
 

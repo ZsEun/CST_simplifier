@@ -16,7 +16,7 @@ from code.cst_connection import CSTConnection
 from code.feature_detector import FeatureDetector, SATParser
 from code.wall_detector import WallDetector, WallInfo, _dot, _normalize, group_walls_by_normal, split_subgroups_by_uv_overlap
 from code.simplifier import Simplifier
-from code.shield_can_dialog import classify_shield_components
+from code.shield_can_dialog import classify_shield_components, pair_cover_frame_by_bbox
 import math
 
 PROJECT = None
@@ -54,7 +54,29 @@ def _run_one_pass(conn, det, wd, simplifier, shape_name, parts, mode, pass_num):
     if mode == "cover":
         walls, corner_fillets = wd.discover_side_walls_validated(ref_pid, ref_n, face_data, adjacency, bboxes)
     else:
-        walls = []
+        # Frame mode: all plane faces perpendicular to reference normal
+        # with W-height filter (wall W span must be > 0.5 × component height)
+        w_axis = ref_n
+        overall_bb = None
+        for pid_bb, bb in bboxes.items():
+            if bb == (0,0,0,0,0,0) or bb == (0.0,0.0,0.0,0.0,0.0,0.0): continue
+            if overall_bb is None:
+                overall_bb = list(bb)
+            else:
+                for i in range(3): overall_bb[i] = min(overall_bb[i], bb[i])
+                for i in range(3, 6): overall_bb[i] = max(overall_bb[i], bb[i])
+        if overall_bb:
+            corners = [(overall_bb[0],overall_bb[1],overall_bb[2]),(overall_bb[3],overall_bb[1],overall_bb[2]),
+                        (overall_bb[0],overall_bb[4],overall_bb[2]),(overall_bb[3],overall_bb[4],overall_bb[2]),
+                        (overall_bb[0],overall_bb[1],overall_bb[5]),(overall_bb[3],overall_bb[1],overall_bb[5]),
+                        (overall_bb[0],overall_bb[4],overall_bb[5]),(overall_bb[3],overall_bb[4],overall_bb[5])]
+            ws = [c[0]*w_axis[0]+c[1]*w_axis[1]+c[2]*w_axis[2] for c in corners]
+            component_w_height = max(ws) - min(ws)
+        else:
+            component_w_height = 1.0
+        min_wall_w_span = component_w_height * 0.5
+
+        candidate_walls = []
         for pid, info in face_data.items():
             if pid == ref_pid: continue
             if info["surface_type"] != "plane-surface": continue
@@ -65,7 +87,19 @@ def _run_one_pass(conn, det, wd, simplifier, shape_name, parts, mode, pass_num):
             if n == (0.0, 0.0, 0.0): continue
             if abs(_dot(n, ref_n)) <= 0.05:
                 bb = bboxes.get(pid, (0, 0, 0, 0, 0, 0))
-                walls.append(WallInfo(face_pid=pid, normal=n, bbox=bb))
+                candidate_walls.append(WallInfo(face_pid=pid, normal=n, bbox=bb))
+
+        walls = []
+        for w in candidate_walls:
+            bb = w.bbox
+            if bb == (0,0,0,0,0,0): continue
+            corners = [(bb[0],bb[1],bb[2]),(bb[3],bb[1],bb[2]),
+                        (bb[0],bb[4],bb[2]),(bb[3],bb[4],bb[2]),
+                        (bb[0],bb[1],bb[5]),(bb[3],bb[1],bb[5]),
+                        (bb[0],bb[4],bb[5]),(bb[3],bb[4],bb[5])]
+            ws = [c[0]*w_axis[0]+c[1]*w_axis[1]+c[2]*w_axis[2] for c in corners]
+            if (max(ws) - min(ws)) >= min_wall_w_span:
+                walls.append(w)
 
     def _wall_area(w):
         b = w.bbox
@@ -225,7 +259,10 @@ def main():
         n_cover = len(classified["cover"])
         n_frame = len(classified["frame"])
         n_one = len(classified["one_piece"])
-        print(f"Auto-classified: {n_cover} covers, {n_frame} frames, {n_one} one-piece")
+        print(f"Keyword classified: {n_cover} covers, {n_frame} frames, {n_one} one-piece")
+
+        # Pair covers and frames by bbox overlap
+        classified = pair_cover_frame_by_bbox(classified, det)
 
         # Show classifier dialog (GUI mode) or terminal confirmation
         # Check if we're in GUI mode (input is monkey-patched)

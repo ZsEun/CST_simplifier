@@ -1,13 +1,12 @@
 # CST CAD Model Simplifier
 
-Automates detection and removal of holes and dimples in STP-imported CAD models within CST Studio Suite 2025. Two tools:
+Automates detection and removal of holes and dimples in STP-imported CAD models within CST Studio Suite 2025. Tools:
 
 1. **PCB Board Simplifier** (`run_sunray_v6.py`) — removes screw holes from flat PCB boards
-2. **Shield Can Cover Simplifier** (`run_led_v2.py`) — removes dimples/holes from shield can cover side walls
-3. **Shield Can Frame Simplifier** (`run_frame_v1.py`) — removes dimples/holes from shield can frame side walls
-4. **Shield Can Contact Bridge** (`debug_contact_v17_shieldcan.py`) — detects gap between shield can cover and frame, creates a bridge by extruding the frame's top face to close the gap
-5. **PCB Grounding Bridge** (`debug_pcb_edge_v2.py`) — detects components near the PCB with gaps, bridges them to the PCB by extruding the closest parallel face
-6. **Component Cleanup** (`gui_cleanup.py`) — identifies and deletes plastic/unnecessary components by keyword matching, with auto-delete, exclude lists, and keyword import/export
+2. **Shield Can Simplifier** (`run_shieldcan.py`) — removes dimples/holes from shield can cover and frame side walls, with bbox-based cover/frame pairing, two-pass verification workflow
+3. **Shield Can Contact Bridge** (`debug_contact_v17_shieldcan.py`) — detects gap between shield can cover and frame, creates a bridge by extruding the frame's top face to close the gap
+4. **PCB Grounding Bridge** (`debug_pcb_edge_v2.py`) — detects components near the PCB with gaps, bridges them to the PCB by extruding the closest parallel face
+5. **Component Cleanup** (`gui_cleanup.py`) — identifies and deletes plastic/unnecessary components by keyword matching, with auto-delete, exclude lists, and keyword import/export
 7. **Connector Replacement** (`debug_connector_v2.py`) — replaces connector components with PEC blocks, bridges to FPC and PCB, merges bridges, and cleans up overlapping components
 
 Both connect via COM automation, export SAT geometry, parse topology, and fill features using `AddToHistory` + `RemoveSelectedFaces`.
@@ -144,10 +143,17 @@ For each wall in the sub-group, find dimple faces using local UVW coordinate pro
 
 ## Shield Can Frame Simplifier Algorithm
 
-### 1. Wall Detection (Frame)
-- Find bottom face (largest plane face by bbox area)
-- Side walls = all plane faces whose normal is perpendicular to bottom face normal (|dot| ≤ 0.05)
-- Simpler than cover because frame walls don't need adjacency walk
+### 1. Wall Detection (Frame) — W-Height Filtered
+- Find reference face (largest plane face by bbox area) → W axis = reference normal
+- Compute component overall bbox → project onto W axis → component W height
+- Find all plane faces perpendicular to reference normal (|dot| ≤ 0.05)
+- **W-height filter**: wall W span must be ≥ 50% of component W height. Rejects tiny structural faces at corners.
+
+### 2. Wall Sub-Grouping (same as cover)
+- Copper thickness measurement from two largest parallel plane faces
+- Group by normal (dot > 0.99)
+- Recursive W-distance splitting (threshold = 1.5× copper thickness)
+- UV overlap splitting for sub-groups with >2 faces
 
 ### 2. Dimple Detection (per wall)
 For each wall, find dimple faces using local UVW coordinate projection:
@@ -167,6 +173,27 @@ For each wall, find dimple faces using local UVW coordinate projection:
 - Track consumed faces to avoid duplicate fills
 - For each wall with dimples: set WCS aligned with wall, highlight, ask user, fill via AddToHistory
 - Use silent fill (`_try_fill_hole_silent`) to avoid GUI error popups
+
+## Shield Can Component Pairing
+
+Before processing, covers and frames are paired by bbox overlap to identify two-piece vs one-piece shield cans.
+
+### Algorithm
+1. Classify components by keyword: SHIELD+COVER → cover, SHIELD+FRAM → frame, SHIELD alone → one-piece
+2. For each cover and frame, export SAT and compute overall bbox (union of all face bboxes)
+3. For each cover, find the best matching frame by:
+   - UV overlap > 50% in both axes (project bboxes onto the two larger dimensions)
+   - W proximity: W gap ≤ 2× thicker component's W span (cover and frame must be stacked)
+4. Paired → two-piece (cover + frame processed separately)
+5. Unpaired → moved to one-piece category
+6. Show classifier dialog for user to review/move/remove before processing
+
+## Two-Pass Verification Workflow
+
+Both cover and frame simplification use a two-pass workflow:
+- **Pass 1**: Export SAT → detect walls → detect dimples → ask user confirmation → fill
+- **Pass 2**: Re-export SAT (fresh geometry after pass 1) → re-detect from scratch → ask user confirmation for remaining dimples
+- If pass 2 finds nothing → "Verification passed"
 
 ## Component Cleanup Tool
 
