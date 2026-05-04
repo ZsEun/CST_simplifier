@@ -177,6 +177,16 @@ class App:
         )
         self.btn6.pack(side="left", padx=3)
 
+        # Third row of buttons
+        btn_frame3 = tk.Frame(root, padx=10, pady=2)
+        btn_frame3.pack(fill="x")
+
+        self.btn7 = tk.Button(
+            btn_frame3, text="CMA Setup",
+            command=lambda: self._run_tool("cma"), width=30, height=1,
+        )
+        self.btn7.pack(side="left", padx=3)
+
         # Log area
         log_frame = tk.Frame(root, padx=10, pady=5)
         log_frame.pack(fill="both", expand=True)
@@ -230,6 +240,7 @@ class App:
         self.btn4.config(state=state)
         self.btn5.config(state=state)
         self.btn6.config(state=state)
+        self.btn7.config(state=state)
 
     def _run_tool(self, tool):
         project = self.project_path.get().strip()
@@ -267,6 +278,8 @@ class App:
                 self._run_connector(project)
             elif tool == "aggressive":
                 self._run_aggressive(project)
+            elif tool == "cma":
+                self._run_cma(project)
             self.root.after(0, lambda: self.status.set("Done. Ready for next tool."))
         except UserQuitException:
             print("\nUser quit.")
@@ -357,6 +370,14 @@ class App:
         importlib.reload(agg_mod)
         agg_mod.PROJECT = project
         agg_mod.main()
+
+    def _run_cma(self, project):
+        """Run CMA simulation setup."""
+        import importlib
+        import code.cma_setup as cma_mod
+        importlib.reload(cma_mod)
+        cma_mod.PROJECT = project
+        cma_mod.main()
 
 
 def main():

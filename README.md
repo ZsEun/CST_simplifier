@@ -8,6 +8,7 @@ Automates detection and removal of holes and dimples in STP-imported CAD models 
 4. **PCB Grounding Bridge** (`debug_pcb_edge_v2.py`) — detects components near the PCB with gaps, bridges them to the PCB by extruding the closest parallel face
 5. **Component Cleanup** (`gui_cleanup.py`) — identifies and deletes plastic/unnecessary components by keyword matching, with auto-delete, exclude lists, and keyword import/export
 7. **Connector Replacement** (`debug_connector_v2.py`) — replaces connector components with PEC blocks, bridges to FPC and PCB, merges bridges, and cleans up overlapping components
+8. **CMA Simulation Setup** (`cma_setup.py`) — automates Characteristic Mode Analysis setup: assigns PEC material to all components, sets frequency range, creates E/H field monitors, configures boundary conditions, sets up the Integral Equation Solver with ACA method and CMA excitation, and generates the surface mesh
 
 Both connect via COM automation, export SAT geometry, parse topology, and fill features using `AddToHistory` + `RemoveSelectedFaces`.
 
@@ -39,6 +40,7 @@ Simple GUI with six buttons:
 4. Bridge Grounding for PCB
 5. Replace Connector
 6. Aggressive Shield Can (delete cover, fill frame top holes)
+7. CMA Setup (automate CMA simulation configuration)
 
 Browse to your .cst file, click a button. Prompts appear as Yes/No/Quit dialogs (Quit stops the entire tool immediately). Output log shown in the GUI. Each run saves a timestamped log file next to the .cst project.
 
@@ -85,8 +87,10 @@ code/
     debug_contact_v17_shieldcan.py - Shield can cover-frame bridge
     debug_pcb_edge_v2.py     - PCB grounding bridge
     debug_connector_v2.py    - Connector replacement with FPC/PCB bridging
+    cma_setup.py             - CMA simulation setup automation
+    run_cma_setup.py         - CMA setup standalone runner
     gui_cleanup.py       - Component cleanup GUI (separate tool)
-    gui.py               - GUI launcher (5 buttons)
+    gui.py               - GUI launcher (7 buttons)
 ```
 
 
@@ -300,6 +304,39 @@ python -m code.debug_connector_v2
 - >100 candidate handling: ask user to auto-detect or manually input
 - Progress logging during long scans
 - Solid.Add merges bridges into a single block
+
+## CST 2025 COM API Notes
+
+### CMA Simulation Setup
+
+Automates the full CMA (Characteristic Mode Analysis) configuration workflow for the Integral Equation Solver.
+
+```bash
+python -m code.run_cma_setup              # standalone runner (defaults to EM_Sunray_v2.cst)
+python -m code.run_cma_setup "model.cst"  # specify model path
+```
+
+Or use the "CMA Setup" button in the GUI.
+
+### Workflow Steps
+1. **Assign PEC material** to all solid components
+2. **Set frequency range** (user provides min/max GHz, min > 0)
+3. **Create E-field and H-field monitors** at user-specified frequency
+4. **Set boundary conditions** to expanded open (all 6 faces)
+5. **Configure I-Solver** — switches to HF IntegralEq, sets ACA method (IterativeMoM), CMA excitation, mode count (default 10), disabled mode tracking, frequency samples as monitors, weighting coefficients enabled, CPU acceleration (8 devices)
+6. **Generate surface mesh** and display in mesh view mode
+
+### CST 2025 VBA Notes for I-Solver
+- `ChangeSolverType "HF IntegralEq"` — switches to I-Solver (must be direct VBA, not inside AddToHistory)
+- `FDSolver.Type "IterativeMoM"` — sets ACA method
+- `FDSolver.Stimulation "CMA", "All"` — sets CMA excitation
+- `FDSolver.MaximumNumberOfCPUDevices "8"` — CPU acceleration
+- `IESolver.NumberOfModesCMA` — number of characteristic modes
+- `IESolver.ModeTrackingCMA "False"` — disable mode tracking
+- `IESolver.FrequencySamplesCMA "0"` — use monitor frequencies
+- `Mesh.Update` — generates surface mesh (not `Mesh.Generate` which doesn't exist)
+- `FDSolver.Method "Integral Equation"` — does NOT work in CST MWS 2025
+- `ChangeSolverType "HF IntEq"` — INVALID (correct string is `"HF IntegralEq"`)
 
 ## CST 2025 COM API Notes
 
