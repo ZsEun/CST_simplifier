@@ -9,6 +9,7 @@ Automates detection and removal of holes and dimples in STP-imported CAD models 
 5. **Component Cleanup** (`gui_cleanup.py`) — identifies and deletes plastic/unnecessary components by keyword matching, with auto-delete, exclude lists, and keyword import/export
 7. **Connector Replacement** (`debug_connector_v2.py`) — replaces connector components with PEC blocks, bridges to FPC and PCB, merges bridges, and cleans up overlapping components
 8. **CMA Simulation Setup** (`cma_setup.py`) — automates Characteristic Mode Analysis setup: assigns PEC material to all components, sets frequency range, creates E/H field monitors, configures boundary conditions, sets up the Integral Equation Solver with ACA method and CMA excitation, and generates the surface mesh
+9. **Eigenmode Simulation Setup** (`eigenmode_setup.py`) — automates per-shield-can eigenmode simulation: identifies shield can components by keyword, exports each as SAB, creates isolated CST projects with PEC material, electric boundaries, eigenmode solver (30 modes), and CPU acceleration
 
 Both connect via COM automation, export SAT geometry, parse topology, and fill features using `AddToHistory` + `RemoveSelectedFaces`.
 
@@ -41,6 +42,7 @@ Simple GUI with six buttons:
 5. Replace Connector
 6. Aggressive Shield Can (delete cover, fill frame top holes)
 7. CMA Setup (automate CMA simulation configuration)
+8. Eigenmode Setup (per-shield-can eigenmode simulation projects)
 
 Browse to your .cst file, click a button. Prompts appear as Yes/No/Quit dialogs (Quit stops the entire tool immediately). Output log shown in the GUI. Each run saves a timestamped log file next to the .cst project.
 
@@ -88,7 +90,9 @@ code/
     debug_pcb_edge_v2.py     - PCB grounding bridge
     debug_connector_v2.py    - Connector replacement with FPC/PCB bridging
     cma_setup.py             - CMA simulation setup automation
+    eigenmode_setup.py       - Eigenmode simulation setup (per shield can)
     run_cma_setup.py         - CMA setup standalone runner
+    run_eigenmode_setup.py   - Eigenmode setup standalone runner
     gui_cleanup.py       - Component cleanup GUI (separate tool)
     gui.py               - GUI launcher (7 buttons)
 ```
@@ -337,6 +341,43 @@ Or use the "CMA Setup" button in the GUI.
 - `Mesh.Update` — generates surface mesh (not `Mesh.Generate` which doesn't exist)
 - `FDSolver.Method "Integral Equation"` — does NOT work in CST MWS 2025
 - `ChangeSolverType "HF IntEq"` — INVALID (correct string is `"HF IntegralEq"`)
+
+### Eigenmode Simulation Setup
+
+Automates the creation of per-component eigenmode simulation projects from shield can components.
+
+```bash
+python -m code.run_eigenmode_setup              # standalone runner (defaults to EM_Sunray_v2.cst)
+python -m code.run_eigenmode_setup "model.cst"  # specify model path
+```
+
+Or use the "Eigenmode Setup" button in the GUI.
+
+### Eigenmode Workflow
+1. **Select RF technologies**: WiFi 2G (1.5–7.5 GHz), WiFi 5G (4–15 GHz), BLE/BT (1.5–7.5 GHz), LoRa (0.7–3 GHz), or custom. Multiple selections → combined range (min of mins, max of maxes).
+2. **Identify shield cans**: Keyword matching (SHIELD + COVER/FRAM) on all solids
+3. **Confirm components**: Each selected in CST GUI for user verification (y/n/q)
+4. **Per-component processing** (creates a new CST project for each):
+   - Export component as SAB from source project
+   - Create new MWS project, import SAB
+   - Assign PEC material to all solids
+   - Set electric boundary conditions (all 6 faces)
+   - Set frequency range from RF technology selection
+   - Switch to eigenmode solver (`ChangeSolverType "HF Eigenmode"`)
+   - Configure: 30 modes, frequency target = fmin, CPU acceleration (8 devices)
+   - Generate mesh
+   - Save project as `Eigenmode_<ComponentName>.cst`
+
+### CST 2025 VBA Notes for Eigenmode Solver
+- `ChangeSolverType "HF Eigenmode"` — direct VBA, NOT AddToHistory
+- `EigenmodeSolver.SetNumberOfModes "30"` — via AddToHistory
+- `EigenmodeSolver.SetFrequencyTarget "True", "fmin"` — via AddToHistory
+- `EigenmodeSolver.SetUseParallelization "True"` — CPU acceleration (note: "Set" prefix)
+- `EigenmodeSolver.MaximumNumberOfCPUDevices "8"` — CPU devices (note: NO "Set" prefix)
+- `Solver.UseParallelization` does NOT work for eigenmode — must use `EigenmodeSolver` object
+- SAB export: `SAT.Reset` + `.FileName` + `.Write "comp:solid"`
+- SAB import: `SAT.Reset` + `.FileName` + `.Id "1"` + `.Read`
+- New project: `call_method(app, "NewMWS")` via COM
 
 ## CST 2025 COM API Notes
 

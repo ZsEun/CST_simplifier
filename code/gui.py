@@ -187,6 +187,12 @@ class App:
         )
         self.btn7.pack(side="left", padx=3)
 
+        self.btn8 = tk.Button(
+            btn_frame3, text="Eigenmode Setup",
+            command=lambda: self._run_tool("eigenmode"), width=30, height=1,
+        )
+        self.btn8.pack(side="left", padx=3)
+
         # Log area
         log_frame = tk.Frame(root, padx=10, pady=5)
         log_frame.pack(fill="both", expand=True)
@@ -241,6 +247,7 @@ class App:
         self.btn5.config(state=state)
         self.btn6.config(state=state)
         self.btn7.config(state=state)
+        self.btn8.config(state=state)
 
     def _run_tool(self, tool):
         project = self.project_path.get().strip()
@@ -280,6 +287,8 @@ class App:
                 self._run_aggressive(project)
             elif tool == "cma":
                 self._run_cma(project)
+            elif tool == "eigenmode":
+                self._run_eigenmode(project)
             self.root.after(0, lambda: self.status.set("Done. Ready for next tool."))
         except UserQuitException:
             print("\nUser quit.")
@@ -378,6 +387,14 @@ class App:
         importlib.reload(cma_mod)
         cma_mod.PROJECT = project
         cma_mod.main()
+
+    def _run_eigenmode(self, project):
+        """Run Eigenmode simulation setup."""
+        import importlib
+        import code.eigenmode_setup as eigen_mod
+        importlib.reload(eigen_mod)
+        eigen_mod.PROJECT = project
+        eigen_mod.main()
 
 
 def main():
